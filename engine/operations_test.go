@@ -327,3 +327,86 @@ func TestOperations_ConcurrentGetPut(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestOperations_KeysAndForEach(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "keys_test.db"), 1024*1024)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// Initial empty count
+	count, err := db.KeyCount()
+	if err != nil || count != 0 {
+		t.Fatalf("expected count 0, got %d (err=%v)", count, err)
+	}
+
+	// Insert in non-alphabetical order
+	db.Put([]byte("banana"), []byte("yellow"))
+	db.Put([]byte("apple"), []byte("red"))
+	db.Put([]byte("cherry"), []byte("dark-red"))
+	db.Put([]byte("empty-item"), []byte{})
+	db.Put([]byte("to-delete"), []byte("temporary"))
+	db.Delete([]byte("to-delete"))
+
+	// Verify KeyCount
+	count, err = db.KeyCount()
+	if err != nil || count != 4 {
+		t.Fatalf("expected count 4, got %d (err=%v)", count, err)
+	}
+
+	// Verify Keys() is sorted and excludes deleted key
+	keys, err := db.Keys()
+	if err != nil {
+		t.Fatalf("Keys() failed: %v", err)
+	}
+	expectedKeys := []string{"apple", "banana", "cherry", "empty-item"}
+	if len(keys) != len(expectedKeys) {
+		t.Fatalf("expected %d keys, got %d", len(expectedKeys), len(keys))
+	}
+	for i, k := range expectedKeys {
+		if keys[i] != k {
+			t.Errorf("keys[%d]: expected %s, got %s", i, k, keys[i])
+		}
+	}
+
+	// Verify ForEach() visits each key in order
+	var visitedKeys []string
+	var visitedVals []string
+	err = db.ForEach(func(k string, v []byte) error {
+		visitedKeys = append(visitedKeys, k)
+		visitedVals = append(visitedVals, string(v))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ForEach failed: %v", err)
+	}
+
+	expectedVals := []string{"red", "yellow", "dark-red", ""}
+	for i := range expectedKeys {
+		if visitedKeys[i] != expectedKeys[i] {
+			t.Errorf("ForEach key[%d]: expected %s, got %s", i, expectedKeys[i], visitedKeys[i])
+		}
+		if visitedVals[i] != expectedVals[i] {
+			t.Errorf("ForEach val[%d]: expected '%s', got '%s'", i, expectedVals[i], visitedVals[i])
+		}
+	}
+
+	// Test early exit on error from ForEach callback
+	var earlyCount int
+	stopErr := errors.New("stop iteration")
+	err = db.ForEach(func(k string, v []byte) error {
+		earlyCount++
+		if earlyCount == 2 {
+			return stopErr
+		}
+		return nil
+	})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("expected stopErr, got %v", err)
+	}
+	if earlyCount != 2 {
+		t.Fatalf("expected earlyCount 2, got %d", earlyCount)
+	}
+}

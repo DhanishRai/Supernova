@@ -3,6 +3,7 @@ package killitdb
 import (
 	"fmt"
 	"io"
+	"sort"
 )
 
 // Put inserts or updates a key-value pair.
@@ -144,4 +145,81 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 
 	return valBuf, nil
+}
+
+// KeyCount returns the total number of active keys in the database.
+func (db *DB) KeyCount() (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
+	if db.unusable {
+		return 0, ErrDatabaseUnusable
+	}
+
+	return db.index.Len(), nil
+}
+
+// Keys returns a sorted slice of all active keys in the database.
+func (db *DB) Keys() ([]string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if db.unusable {
+		return nil, ErrDatabaseUnusable
+	}
+
+	keys := db.index.Keys()
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// ForEach executes fn for each active key-value pair in alphabetical order.
+// The iteration stops and returns immediately if fn returns a non-nil error.
+// The entire iteration is guarded under db.mu.RLock().
+func (db *DB) ForEach(fn func(key string, val []byte) error) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	if db.unusable {
+		return ErrDatabaseUnusable
+	}
+
+	keys := db.index.Keys()
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		ent, found := db.index.Get(k)
+		if !found {
+			continue
+		}
+
+		var valBuf []byte
+		if ent.valueLen > 0 {
+			valBuf = make([]byte, ent.valueLen)
+			n, err := db.file.ReadAt(valBuf, ent.valueOffset)
+			if err != nil && err != io.EOF {
+				return fmt.Errorf("read value failed for key %s: %w", k, err)
+			}
+			if n != int(ent.valueLen) {
+				return fmt.Errorf("short read for value of key %s at offset %d: expected %d, got %d", k, ent.valueOffset, ent.valueLen, n)
+			}
+		} else {
+			valBuf = []byte{}
+		}
+
+		if err := fn(k, valBuf); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

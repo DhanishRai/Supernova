@@ -72,3 +72,12 @@ func (idx *Index) ApplyBatch(ops []IndexOp) {
 func (idx *Index) Len() int {
 	return len(idx.entries)
 }
+
+// Keys returns a slice containing all active keys in the index.
+func (idx *Index) Keys() []string {
+	keys := make([]string, 0, len(idx.entries))
+	for k := range idx.entries {
+		keys = append(keys, k)
+	}
+	return keys
+}
