@@ -79,6 +79,30 @@ The torture tool is an adversarial testing harness designed to break our Go key-
 - **`tests/test_large_batches.py`**:
   - Exercises all 12 large-batch scenarios and defect models: 10,000-op all-PUT, all-DEL, mixed, repeated keys, PUT-then-DEL, DEL-then-PUT, transmission crash, processing crash, post-durability pre-ACK crash, torn batch rejection, live/mock engine integration, and memory efficiency.
 
+### CP8: Professional Failure Reporting and Reproducibility
+- **Predictable Failure Artifact Preservation**:
+  - Preserved in a predictable directory inside `torture tool/artifacts/` (customizable via `--artifacts-dir`).
+  - Saved on any failure or crash:
+    - `corrupted_target.db`: Exact snapshot of the target database file.
+    - Sidecars (`*.wal`, `*.data`): Preserved alongside the main database file.
+    - `failure_report.json`: Machine-readable JSON structured failure record.
+    - `diagnostic_report.txt`: Human-readable formatted diagnostic investigation document.
+    - `oracle_history.json`: Complete operation history with lean summaries for values > 256 bytes.
+    - `recovered_dump.json`: Dump of recovered state with value lengths and SHA-256 digests.
+- **Canonical Failure Classification Taxonomy**:
+  - `Engine failure`: Unexpected non-zero process exits, engine segfaults, or unprovoked terminations.
+  - `Protocol failure`: Malformed wire responses, unrecognized operation IDs, or codec violations.
+  - `Oracle failure`: Durability violations (missing ACKed keys), atomicity violations (torn batches), or data corruption.
+  - `Torture tool failure`: Unexpected exceptions in the testing harness itself (never masked or reported as PASS).
+  - `Timeout`: Unresponsive operations or worker timeouts.
+  - `Recovery failure`: Subcommand failures during `kvdb open`, `kvdb check`, or `kvdb dump`.
+- **Reproducibility Guarantee & Disclaimer**:
+  - Workload generation and randomized kill delays are deterministically derived from `--seed` using isolated `random.Random` instances. No use of the global `random` module.
+  - Mandatory disclaimer documented and embedded in all failure artifacts:
+    > *"A seed reproduces workload generation and requested random delays, but cannot guarantee identical operating-system scheduling, disk timing, or exact crash instructions."*
+- **`tests/test_reporting.py`**:
+  - Validates artifact preservation, structured JSON report fields, large-value memory bounding (hashes/lengths), cryptographic SHA-256 correctness, deterministic workload reproduction, classification taxonomy, and harness crash safety.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

@@ -34,7 +34,7 @@ def main(args=None) -> int:
     if not os.path.exists(config.engine_bin):
         print("=" * 65)
         print("SUPERNOVA CRASH-CONSISTENCY TORTURE TOOL")
-        print("Stage: CP4 (Single-Writer Random Crash Testing)")
+        print("Stage: CP8 (Failure Reporting & Reproducibility)")
         print(f"Mode: {config.mode.value} | Iterations: {config.iterations} | Seed: {config.seed}")
         print("=" * 65)
         print(f"NOTICE: Engine executable '{config.engine_bin}' not found.")

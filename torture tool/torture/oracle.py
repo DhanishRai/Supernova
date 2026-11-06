@@ -30,11 +30,11 @@ import time
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 
-def hash_val(val: Optional[str]) -> str:
-    """Returns a short SHA-256 hex digest for reporting."""
+def hash_val(val: Optional[str]) -> Optional[str]:
+    """Returns a full SHA-256 hex digest for reporting."""
     if val is None:
-        return "<none>"
-    return hashlib.sha256(val.encode("utf-8")).hexdigest()[:16]
+        return None
+    return hashlib.sha256(val.encode("utf-8")).hexdigest()
 
 
 def format_val_summary(val: Optional[str], max_len: int = 64) -> str:
@@ -48,7 +48,7 @@ def format_val_summary(val: Optional[str], max_len: int = 64) -> str:
     length = len(val)
     if length <= max_len and "\n" not in val and "\r" not in val:
         return repr(val)
-    h = hash_val(val)
+    h = (hash_val(val) or "<none>")[:16]
     snippet = repr(val[:24] + "..." if length > 24 else val)
     return f"<len={length}, sha256={h}, preview={snippet}>"
 
@@ -147,6 +147,11 @@ class DatabaseOracle:
         with self._lock:
             return len(self._history)
 
+    @property
+    def history(self) -> List[OperationRecord]:
+        """Returns a snapshot copy of the full submission history."""
+        return self.get_history()
+
     def record_put(
         self,
         op_id: str,
@@ -219,6 +224,28 @@ class DatabaseOracle:
             self._history.append(rec)
             self._history_by_id[op_id] = rec
             return rec
+
+    def record_submission(
+        self,
+        op_id: str,
+        op_type: OpType,
+        key: Optional[str] = None,
+        value: Optional[str] = None,
+        batch_items: Optional[List[BatchSubOp]] = None,
+        writer_id: str = "main",
+    ) -> OperationRecord:
+        """Convenience dispatcher to record operation submission by OpType."""
+        if op_type == OpType.PUT:
+            if key is None or value is None:
+                raise ValueError("PUT operation requires key and value")
+            return self.record_put(op_id, key=key, value=value, writer_id=writer_id)
+        elif op_type == OpType.DEL:
+            if key is None:
+                raise ValueError("DEL operation requires key")
+            return self.record_del(op_id, key=key, writer_id=writer_id)
+        elif op_type == OpType.BATCH:
+            return self.record_batch(op_id, items=batch_items or [], writer_id=writer_id)
+        raise ValueError(f"Unsupported OpType: {op_type}")
 
     def record_ack(self, op_id: str) -> None:
         """Marks an operation as successfully acknowledged (fsync durable)."""

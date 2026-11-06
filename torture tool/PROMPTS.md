@@ -930,3 +930,82 @@ STOP after CP7.
 ```
 
 
+---
+
+### Entry 10
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 16:11:00 IST
+- **Development Stage**: CP8 (Professional Failure Reporting and Reproducibility)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP8: professional failure reporting and reproducibility.
+
+OBJECTIVE:
+
+Every failure must report:
+
+- Seed.
+- Iteration.
+- Mode.
+- Database path.
+- Operation IDs.
+- Operation types.
+- Expected state.
+- Actual state.
+- Expected value length.
+- Actual value length.
+- Expected value hash.
+- Actual value hash.
+- Relevant operation history.
+- Child process exit information.
+- Available stderr output.
+
+SAVE:
+
+Preserve useful failure artifacts in a predictable directory inside torture tool/.
+
+REPRODUCIBILITY:
+
+Use deterministic derived seeds for writer threads.
+
+Never use the global random module.
+
+Document:
+
+A seed reproduces workload generation and requested random delays, but cannot guarantee identical operating-system scheduling, disk timing, or exact crash instructions.
+
+CLASSIFY FAILURES:
+
+- Engine failure.
+- Protocol failure.
+- Oracle failure.
+- Torture tool failure.
+- Timeout.
+- Recovery failure.
+
+A torture-tool crash must never be reported as PASS.
+
+TEST:
+
+Verify:
+- Failure artifact creation.
+- Large-value reporting.
+- Hash correctness.
+- Reproducible workload generation.
+- Failure classification.
+
+GIT COMMIT:
+
+improve failure reports
+
+STOP after CP8.
+```
+
+
+

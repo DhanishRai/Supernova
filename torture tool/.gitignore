@@ -4,3 +4,5 @@ __pycache__/
 *.pyd
 *.log
 *.db
+artifacts/
+failures/

@@ -66,6 +66,7 @@ class TortureConfig:
     max_bytes: Optional[int] = None
     min_kill_delay_ms: int = 1
     max_kill_delay_ms: int = 50
+    artifacts_dir: Optional[str] = None
 
     def validate(self) -> None:
         """
@@ -158,6 +159,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Maximum random delay in ms before killing engine (default: 50)",
     )
 
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default=None,
+        help="Directory where diagnostic failure artifacts are preserved upon failure (default: torture tool/artifacts)",
+    )
+
     return parser
 
 
@@ -191,6 +199,7 @@ def parse_args(args: Optional[List[str]] = None, print_generated_seed: bool = Tr
         max_bytes=parsed.max_bytes,
         min_kill_delay_ms=parsed.min_kill_delay_ms,
         max_kill_delay_ms=parsed.max_kill_delay_ms,
+        artifacts_dir=parsed.artifacts_dir,
     )
     config.validate()
     return config
