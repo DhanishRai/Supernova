@@ -324,42 +324,92 @@ class DatabaseOracle:
                     for sub in op.batch_items:
                         unacked_keys.add(sub.key)
 
+            # Helper to check if two operations were concurrent in-flight
+            def were_concurrent(op1: OperationRecord, op2: OperationRecord) -> bool:
+                # If neither has resolved_at, or both were in-flight at overlapping times
+                t1_start = op1.submitted_at
+                t1_end = op1.resolved_at if op1.resolved_at is not None else float("inf")
+                t2_start = op2.submitted_at
+                t2_end = op2.resolved_at if op2.resolved_at is not None else float("inf")
+                return (t1_start <= t2_end) and (t2_start <= t1_end)
+
             for key, expected_val in definite_state.items():
                 if key not in actual_dump:
-                    # Missing an ACKed key! Allowed only if a later unACKed DEL deleted it.
-                    can_be_deleted_by_unacked = any(
+                    # Missing an ACKed key! Allowed only if:
+                    # a) a later unACKed DEL deleted it, OR
+                    # b) a concurrent ACKed DEL overlapped the last write and committed second.
+                    prov = definite_prov.get(key)
+                    last_op = self._history_by_id.get(prov.op_id) if prov else None
+
+                    can_be_deleted = any(
                         (op.op_type == OpType.DEL and op.key == key) or
                         (op.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == key for s in op.batch_items))
                         for op in unacked_ops
                     )
-                    if not can_be_deleted_by_unacked:
+                    if not can_be_deleted and last_op is not None:
+                        # Check for concurrent ACKed DELs
+                        can_be_deleted = any(
+                            (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
+                                (o.op_type == OpType.DEL and o.key == key) or
+                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == key for s in o.batch_items))
+                            ))
+                            for o in self._history
+                        )
+
+                    if not can_be_deleted:
                         violations.append(
                             f"DURABILITY VIOLATION: ACKed key '{key}' with value '{expected_val}' is MISSING from recovered database!"
                         )
                 else:
                     actual_val = actual_dump[key]
                     if actual_val != expected_val:
-                        # Mismatched value: Allowed only if a later unACKed PUT overwrote it
-                        can_be_overwritten_by_unacked = any(
+                        prov = definite_prov.get(key)
+                        last_op = self._history_by_id.get(prov.op_id) if prov else None
+
+                        # Value differs from baseline sequential: Allowed if:
+                        # a) An unACKed operation overwrote it, OR
+                        # b) A concurrent ACKed write overlapped and committed second.
+                        can_be_overwritten = any(
                             (op.op_type == OpType.PUT and op.key == key and op.value == actual_val) or
                             (op.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in op.batch_items))
                             for op in unacked_ops
                         )
-                        if not can_be_overwritten_by_unacked:
+                        if not can_be_overwritten and last_op is not None:
+                            can_be_overwritten = any(
+                                (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
+                                    (o.op_type == OpType.PUT and o.key == key and o.value == actual_val) or
+                                    (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in o.batch_items))
+                                ))
+                                for o in self._history
+                            )
+
+                        if not can_be_overwritten:
                             violations.append(
                                 f"DURABILITY VIOLATION: ACKed key '{key}' expected '{expected_val}', but found '{actual_val}'!"
                             )
 
             # 4. Check Deleted Keys: Keys ACKed as deleted must NOT be present
-            # (unless re-created by a later unACKed PUT)
+            # (unless re-created by a later unACKed PUT or concurrent ACKed PUT)
             for key, prov in definite_prov.items():
                 if prov.is_deleted and key in actual_dump:
-                    can_be_recreated_by_unacked = any(
-                        (op.op_type == OpType.PUT and op.key == key) or
-                        (op.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key for s in op.batch_items))
+                    last_op = self._history_by_id.get(prov.op_id)
+                    actual_val = actual_dump[key]
+
+                    can_be_recreated = any(
+                        (op.op_type == OpType.PUT and op.key == key and op.value == actual_val) or
+                        (op.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in op.batch_items))
                         for op in unacked_ops
                     )
-                    if not can_be_recreated_by_unacked:
+                    if not can_be_recreated and last_op is not None:
+                        can_be_recreated = any(
+                            (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
+                                (o.op_type == OpType.PUT and o.key == key and o.value == actual_val) or
+                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in o.batch_items))
+                            ))
+                            for o in self._history
+                        )
+
+                    if not can_be_recreated:
                         violations.append(
                             f"DELETION VIOLATION: Key '{key}' was ACKed as deleted by op '{prov.op_id}', but is still present with value '{actual_dump[key]}'!"
                         )

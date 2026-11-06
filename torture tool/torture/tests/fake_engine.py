@@ -113,14 +113,18 @@ def do_serve(db_path: str) -> int:
 
     while True:
         try:
-            line = sys.stdin.readline()
+            raw_line = sys.stdin.readline()
         except Exception:
             break
 
-        if not line:
+        if not raw_line:
             break
 
-        line = line.strip()
+        if not raw_line.endswith("\n"):
+            # Severed mid-line by SIGKILL! Drop incomplete wire fragment
+            break
+
+        line = raw_line.strip()
         if not line:
             continue
 

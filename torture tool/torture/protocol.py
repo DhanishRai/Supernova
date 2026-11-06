@@ -379,14 +379,16 @@ class EngineClient:
         3. Waits for ACK/ERR on pending op's event.
         4. Validates timeouts and errors.
         """
-        if not self.is_alive or self._proc is None or self._proc.stdin is None:
-            raise EngineProcessError("Cannot send command: engine process is not running")
+        if not self.is_alive or self._proc is None or self._proc.stdin is None or self._eof_reached.is_set():
+            raise EngineProcessError("Cannot send command: engine process is not running or has terminated")
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         pending = _PendingOp(op_id=op_id)
 
-        # 1. Register pending op
+        # 1. Register pending op under lock
         with self._pending_lock:
+            if self._eof_reached.is_set():
+                raise UnexpectedEOFError("Cannot send command: engine stdout reached EOF")
             self._pending_ops[op_id] = pending
 
         # 2. Thread-safe write to stdin and flush
@@ -501,9 +503,21 @@ class EngineClient:
     def kill(self, sig: int = signal.SIGKILL) -> int:
         """
         Adversarially terminates the engine process with SIGKILL (or specified signal).
-        Verifies termination and joins worker threads.
+        Immediately wakes up all in-flight caller threads, verifies termination, and joins workers.
         """
         self._is_running.clear()
+        self._eof_reached.set()
+
+        # Immediately fail and wake up all in-flight callers so they never hang
+        with self._pending_lock:
+            remaining = list(self._pending_ops.values())
+            self._pending_ops.clear()
+            for pending in remaining:
+                pending.exception = UnexpectedEOFError(
+                    f"Process killed with signal {sig} before op '{pending.op_id}' was acknowledged"
+                )
+                pending.event.set()
+
         if self._proc is None:
             return 0
 

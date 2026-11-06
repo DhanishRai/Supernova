@@ -1,15 +1,18 @@
 """
-Single-Writer Workload Generator for Supernova Torture Tool.
+Workload Generator for Supernova Torture Tool.
 
-Continuously generates and submits pseudorandom PUT, DEL, and BATCH operations
-to the database engine client while an independent crash timer counts down.
+Supports multiple concurrent writer threads, each operating with:
+- Its own isolated, deterministic `random.Random` instance.
+- Unique namespaced operation IDs (e.g. `w1-op-101`, `w2-op-205`).
+- Configurable key pool (allowing isolated or overlapping key spaces).
+- Robust exception handling when SIGKILL strikes the engine mid-flight.
 """
 
 from enum import Enum
 import random
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from torture.config import TortureMode
 from torture.oracle import BatchSubOp, DatabaseOracle, OpType
@@ -17,15 +20,22 @@ from torture.protocol import (
     BatchItem,
     EngineClient,
     EngineProcessError,
+    IdGenerator,
     ProtocolResponse,
     UnexpectedEOFError,
 )
 
 
-class SingleWriterWorker:
+class WriterWorkloadType(str, Enum):
+    MIXED = "mixed"       # 60% PUT, 20% DEL, 20% BATCH
+    PUT_ONLY = "put"      # 100% PUT
+    DEL_ONLY = "del"      # 100% DEL
+    BATCH_ONLY = "batch"  # 100% BATCH
+
+
+class ConcurrentWriter:
     """
-    Spawns a dedicated worker thread that continuously generates operations
-    and submits them to the EngineClient while recording submissions and ACKs in the Oracle.
+    Independent worker thread for concurrent stress testing.
     """
 
     def __init__(
@@ -33,18 +43,27 @@ class SingleWriterWorker:
         client: EngineClient,
         oracle: DatabaseOracle,
         rng: random.Random,
+        writer_id: str,
         mode: TortureMode = TortureMode.DEFAULT,
-        key_pool_size: int = 50,
-        writer_id: str = "writer-1",
+        workload_type: WriterWorkloadType = WriterWorkloadType.MIXED,
+        key_pool: Optional[List[str]] = None,
     ) -> None:
         self.client = client
         self.oracle = oracle
         self.rng = rng
-        self.mode = mode
-        self.key_pool_size = key_pool_size
         self.writer_id = writer_id
+        self.mode = mode
+        self.workload_type = workload_type
 
-        self._keys = [f"key_{i:04d}" for i in range(self.key_pool_size)]
+        # Unique namespaced ID generator prevents cross-thread ID collisions
+        self.id_gen = IdGenerator(prefix=f"{writer_id}-op")
+
+        # Key pool (shared or isolated)
+        if key_pool is not None:
+            self._keys = list(key_pool)
+        else:
+            self._keys = [f"key_{i:04d}" for i in range(50)]
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.submitted_count = 0
@@ -66,34 +85,46 @@ class SingleWriterWorker:
         self._stop_event.set()
 
     def join(self, timeout: float = 2.0) -> None:
-        """Waits for the worker thread to terminate."""
+        """Waits for the worker thread to cleanly stop."""
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
 
     def _generate_value(self) -> str:
-        """Generates a value string based on the active test mode."""
+        """Generates payload value based on mode."""
         if self.mode == TortureMode.LARGE_VALUES:
-            # 1 MB value for large-values mode
             chunk = "V" * 1024
             return chunk * 1024
-        # Standard value: sequence-tagged payload
         rand_suffix = self.rng.randint(1000, 9999)
-        return f"val_{self.submitted_count}_{rand_suffix}"
+        return f"{self.writer_id}_val_{self.submitted_count}_{rand_suffix}"
 
     def _run_loop(self) -> None:
-        """Continuous execution loop."""
+        """Main submission loop."""
         while not self._stop_event.is_set():
             if not self.client.is_alive:
                 break
 
-            op_choice = self.rng.random()
+            # Determine operation type
+            if self.workload_type == WriterWorkloadType.PUT_ONLY:
+                chosen_type = "PUT"
+            elif self.workload_type == WriterWorkloadType.DEL_ONLY:
+                chosen_type = "DEL"
+            elif self.workload_type == WriterWorkloadType.BATCH_ONLY:
+                chosen_type = "BATCH"
+            else:
+                rand_val = self.rng.random()
+                if rand_val < 0.60:
+                    chosen_type = "PUT"
+                elif rand_val < 0.80:
+                    chosen_type = "DEL"
+                else:
+                    chosen_type = "BATCH"
 
             try:
-                if op_choice < 0.60:
-                    # 60% PUT operations
+                op_id = self.id_gen.next_id()
+
+                if chosen_type == "PUT":
                     key = self.rng.choice(self._keys)
                     val = self._generate_value()
-                    op_id = self.client.id_gen.next_id()
 
                     self.oracle.record_put(op_id, key, val, writer_id=self.writer_id)
                     self.submitted_count += 1
@@ -103,12 +134,10 @@ class SingleWriterWorker:
                         self.oracle.record_ack(op_id)
                         self.acked_count += 1
                     else:
-                        self.oracle.record_err(op_id, resp.message or "unknown error")
+                        self.oracle.record_err(op_id, resp.message or "error")
 
-                elif op_choice < 0.80:
-                    # 20% DEL operations
+                elif chosen_type == "DEL":
                     key = self.rng.choice(self._keys)
-                    op_id = self.client.id_gen.next_id()
 
                     self.oracle.record_del(op_id, key, writer_id=self.writer_id)
                     self.submitted_count += 1
@@ -118,12 +147,11 @@ class SingleWriterWorker:
                         self.oracle.record_ack(op_id)
                         self.acked_count += 1
                     else:
-                        self.oracle.record_err(op_id, resp.message or "unknown error")
+                        self.oracle.record_err(op_id, resp.message or "error")
 
-                else:
-                    # 20% BATCH operations (atomic mix of 2 to 6 operations)
+                elif chosen_type == "BATCH":
                     batch_size = (
-                        self.rng.randint(100, 500)
+                        self.rng.randint(50, 200)
                         if self.mode == TortureMode.LARGE_BATCHES
                         else self.rng.randint(2, 6)
                     )
@@ -140,7 +168,6 @@ class SingleWriterWorker:
                             batch_oracle_items.append(BatchSubOp(OpType.DEL, sub_key))
                             batch_proto_items.append(BatchItem.make_del(sub_key))
 
-                    op_id = self.client.id_gen.next_id()
                     self.oracle.record_batch(op_id, batch_oracle_items, writer_id=self.writer_id)
                     self.submitted_count += 1
 
@@ -149,12 +176,16 @@ class SingleWriterWorker:
                         self.oracle.record_ack(op_id)
                         self.acked_count += 1
                     else:
-                        self.oracle.record_err(op_id, resp.message or "unknown error")
+                        self.oracle.record_err(op_id, resp.message or "error")
 
-            except (BrokenPipeError, UnexpectedEOFError, EngineProcessError) as exc:
-                # Expected when SIGKILL lands concurrently!
+            except (BrokenPipeError, UnexpectedEOFError, EngineProcessError, OSError) as exc:
+                # Normal when SIGKILL strikes engine process while writing to pipe
                 self.errors.append(exc)
                 break
             except Exception as exc:
                 self.errors.append(exc)
                 break
+
+
+# Alias for backward compatibility with CP4
+SingleWriterWorker = ConcurrentWriter

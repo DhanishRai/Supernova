@@ -95,17 +95,24 @@ class CrashTestRunner:
 
             proc_pid = client.pid
 
-            # 4. Start active writer
-            worker = SingleWriterWorker(
-                client=client,
-                oracle=oracle,
-                rng=iter_rng,
-                mode=self.config.mode,
-                writer_id=f"writer-iter-{iter_num}",
-            )
-            worker.start()
+            # 4. Start concurrent active writers
+            num_workers = max(1, self.config.workers)
+            workers = []
+            for w_idx in range(1, num_workers + 1):
+                w_seed = iter_rng.randint(1, 100_000_000)
+                worker = SingleWriterWorker(
+                    client=client,
+                    oracle=oracle,
+                    rng=random.Random(w_seed),
+                    mode=self.config.mode,
+                    writer_id=f"w{w_idx}",
+                )
+                workers.append(worker)
 
-            # 5. Choose random millisecond delay while writer is running
+            for worker in workers:
+                worker.start()
+
+            # 5. Choose random millisecond delay while writers are running
             delay_ms = iter_rng.randint(
                 self.config.min_kill_delay_ms,
                 self.config.max_kill_delay_ms,
@@ -115,10 +122,15 @@ class CrashTestRunner:
             # 6. Kill database process with SIGKILL at random instant
             kill_ret = client.kill(signal.SIGKILL)
 
-            # 7. Safely stop and join writer thread
-            worker.stop()
-            worker.join(timeout=1.0)
+            # 7. Safely stop and join writer threads
+            for worker in workers:
+                worker.stop()
+            for worker in workers:
+                worker.join(timeout=1.0)
             client.close()
+
+            total_submitted = sum(w.submitted_count for w in workers)
+            total_acked = sum(w.acked_count for w in workers)
 
             # Verify process actually terminated
             is_dead = not client.is_alive
@@ -140,8 +152,8 @@ class CrashTestRunner:
                 total_iterations=self.config.iterations,
                 passed=passed and killed_by_sigkill,
                 delay_ms=delay_ms,
-                submitted=worker.submitted_count,
-                acked=worker.acked_count,
+                submitted=total_submitted,
+                acked=total_acked,
                 recovered_keys=len(actual_dump),
                 duration_s=t_duration,
                 violations=violations,

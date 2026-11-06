@@ -42,6 +42,17 @@ The torture tool is an adversarial testing harness designed to break our Go key-
 - **`reporting.py`**: Console iteration reporting and failure artifact archiving (copies corrupted DB, dumps, and Oracle JSON log into `/tmp/torture_failures/`).
 - **`runner.py`**: Orchestrates the adversarial crash loop, injecting `SIGKILL` at microsecond/millisecond offsets while the writer is active, re-opening, and verifying recovery safety.
 
+### CP5: Concurrent Writer Testing
+- **`worker.py` (`ConcurrentWriter`)**: Multiple concurrent writer threads, each with:
+  - Isolated deterministic `random.Random` instances derived from the master seed.
+  - Namespaced operation ID generation (`w1-op-...`, `w2-op-...`) guaranteeing zero cross-thread collisions.
+  - Configurable workloads: mixed, put-only, del-only, batch-only across disjoint or shared keys.
+- **`oracle.py` (Linearizability & Concurrency Modeling)**:
+  - Models happened-before relationships ($O_1 \prec O_2$) versus true concurrency ($O_1 \parallel O_2$).
+  - Never assumes Python thread submission order equals commit order.
+  - Accepts any valid linearization of concurrent in-flight writes without weakening baseline durability or integrity.
+- **`tests/test_concurrency.py`**: Exercises all 6 mandated concurrency stress scenarios.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

@@ -720,3 +720,78 @@ Commit legitimate improvements separately.
 
 STOP after the sabotage report.
 ```
+
+
+---
+
+### Entry 7
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:25:55 IST
+- **Development Stage**: CP5 (Concurrent Writer Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP5: concurrent writer testing.
+
+OBJECTIVE:
+
+Support at least two concurrent writer threads.
+
+Each writer must have:
+
+- Unique operation IDs.
+- Its own deterministic random.Random instance.
+- Independent operation generation.
+- Proper exception handling.
+
+SHARED RESOURCES:
+
+- One database process.
+- One stdout reader.
+- One synchronized stdin writer.
+- One thread-safe oracle.
+
+TEST SCENARIOS:
+
+1. Two writers modifying different keys.
+2. Two writers modifying the same keys.
+3. Concurrent PUT and DEL.
+4. Concurrent PUT and BATCH.
+5. Concurrent large batches where supported.
+6. SIGKILL while both writers are active.
+
+CRITICAL ORDERING:
+
+Do not assume Python thread submission order equals database commit order.
+
+Do not assume ACK arrival order establishes commit order unless guaranteed by the engine.
+
+Preserve actual protocol submission ordering.
+
+Model every legal outcome consistent with the engine's documented ordering.
+
+Do not weaken oracle correctness.
+
+TEST:
+
+Check:
+- Deadlocks.
+- Race conditions.
+- Missing responses.
+- Duplicate IDs.
+- Incorrect recovered states.
+- Writer cleanup.
+
+Explain the limitations of concurrent testing.
+
+GIT COMMIT:
+
+add concurrent writers
+
+STOP after CP5.
+```
