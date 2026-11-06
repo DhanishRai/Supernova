@@ -18,7 +18,7 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 9 complete
+- **Status:** Step 10 complete (Engine core verified against all invariants)
 - **Engine Core:**
   - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
@@ -28,7 +28,7 @@ Key guarantees:
   - In-memory hash index (`Index` backed by `map[string]entry`) implemented with ordered batch application.
   - Database file structure and safe initialization (`Open`, `Close`, `DB` struct) implemented with 16-byte header.
   - Internal durable record append (`appendRecord`) with rollback and poison state handling.
-  - Core operations (`Put`, `Delete`, `Get`) implemented with global synchronization.
+  - Core operations (`Put`, `Delete`, `Get`) implemented with global synchronization (`sync.RWMutex`).
   - Atomic multi-operation batch write (`Batch`) implemented:
     - Encodes all batch operations (1–10,000 ops) as **exactly ONE** durable on-disk record.
     - Validates all operations upfront before acquiring write lock or executing disk I/O; rejects invalid batches with zero disk writes.
@@ -45,7 +45,89 @@ Key guarantees:
     - `Open()` delegates entirely to `recoverDatabase()` for a consistent startup path whether the file is new or existing.
     - **Record buffer is reused** across all records during scanning (single growing `[]byte`; no per-record heap alloc).
     - **Value bytes are not loaded into RAM** during recovery; `decodeRecordForRecovery` advances past value bytes without copying them.
-  - Comprehensive unit test suite: **76 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, and all recovery edge cases.
+  - **Comprehensive automated test suite:** **94 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, recovery edge cases, 1,000,000-key recovery benchmark, and all 10 core safety invariants.
+
+---
+
+## Final Engine API
+
+```go
+package killitdb
+
+// Core Database Lifecycle
+func Open(path string, maxBytes int64) (*DB, error)
+func (db *DB) Close() error
+func (db *DB) Size() int64
+func (db *DB) Path() string
+
+// Core Operations
+func (db *DB) Put(key, value []byte) error
+func (db *DB) Get(key []byte) ([]byte, error)
+func (db *DB) Delete(key []byte) error
+func (db *DB) Batch(ops []Operation) error
+```
+
+---
+
+## Durability & Write Ordering
+
+Every write (`Put`, `Delete`, `Batch`) follows a strict, non-negotiable ordering:
+
+1. **Input Validation:** Key length (1–1024 B), value length (0–1 MB), batch size (1–10,000 ops), and DELETE zero-value constraints are checked before taking locks or touching the disk.
+2. **Lock Acquisition:** `db.mu.Lock()` acquired.
+3. **State Check:** Reject immediately if `db.closed` or `db.unusable`.
+4. **In-Memory Encoding:** Entire record (outer header, payload length, CRC32, operation count, operations) is encoded into a contiguous byte buffer.
+5. **Capacity Check:** Verify `oldSize + recordLength <= db.maxBytes`. Return `ErrDiskFull` without writing if limit would be exceeded.
+6. **Disk Write:** Write complete record at `oldSize` using `WriteAt`.
+7. **Hardware Sync:** Issue `Sync()` to flush OS page cache to physical storage.
+8. **Rollback on Write/Sync Failure:** If `WriteAt` or `Sync()` fails, immediately attempt `Truncate(oldSize)` and `Sync()`. If rollback fails or cannot be confirmed, set `db.unusable = true` to permanently poison the in-memory state and prevent further writes.
+9. **Index Update (Only After Durability):** Advance `db.size` and apply all operations to `db.index`.
+10. **Unlock & Return:** Release lock and return success to caller. Readers never observe uncommitted, intermediate, or partial writes.
+
+---
+
+## Crash Recovery Procedure
+
+When `Open(path, maxBytes)` is called:
+1. **Compaction Cleanup:** Remove any orphaned `path + ".tmp"` file left behind by an interrupted compaction.
+2. **Header Initialization:** If file size is < 16 bytes, truncate to 0, write the 16-byte header (`KVDB0001`, version 1, reserved 0), and sync.
+3. **Header Validation:** Validate magic, version, and reserved field.
+4. **Sequential Scan:** Start at offset 16 and read record by record:
+   - Check if at least 8 bytes remain for the outer record header.
+   - Read `payloadLen` and compute total record size.
+   - Verify `totalRecordSize` fits within remaining file size without overflow.
+   - Read complete record into a reused memory buffer.
+   - Compute and verify IEEE CRC32 checksum.
+   - Decode operations and calculate absolute on-disk value offsets (`recordStart + relValOffset`).
+   - Apply operations to in-memory index in order.
+5. **Torn Tail Handling:** Stop scanning at the first incomplete record, CRC mismatch, or corrupted operation. If `scanOffset < fileSize`, truncate the file to `scanOffset` and issue `Sync()`.
+6. **Idempotence:** Recovery is read-only until the final truncation, ensuring recovery itself is completely repeatable if interrupted by another crash.
+
+---
+
+## Error Behavior
+
+| Error | Condition |
+|---|---|
+| `ErrKeyNotFound` | Key does not exist in the database or was deleted by a tombstone. |
+| `ErrDiskFull` | An operation would cause the file size to exceed `maxBytes`. Zero bytes are written to disk. |
+| `ErrDatabaseClosed` | An operation was attempted on a closed database instance. |
+| `ErrDatabaseUnusable` | An I/O write or sync failed and the subsequent rollback could not be confirmed. The DB is permanently poisoned to protect data integrity until restarted. |
+| `ErrInvalidKeyLength` | Key is empty (0 bytes) or exceeds 1024 bytes. |
+| `ErrInvalidValueLength` | Value exceeds 1 MB (1,048,576 bytes). |
+| `ErrDeleteWithValue` | A DELETE operation was submitted with non-empty value bytes. |
+| `ErrEmptyBatch` | Batch was submitted with 0 operations. |
+| `ErrBatchTooLarge` | Batch exceeds 10,000 operations. |
+| `ErrInvalidMagic` / `ErrUnsupportedVersion` / `ErrInvalidHeaderReserved` | Authoritative data file header is corrupted or incompatible. |
+
+---
+
+## Known Limitations
+
+1. **In-Memory RAM Index:** The hash index (`map[string]entry`) keeps all keys, value offsets (8 bytes), and value lengths (4 bytes) in RAM. For 1,000,000 keys, live heap memory is ~129 MB. Databases with tens of millions of keys will require sufficient RAM.
+2. **Append-Only Growth:** Deletes and updates append new records (tombstones / new values) without immediately reclaiming old space on disk. Space reclamation is delegated to the compaction component owned by teammates (`<path>.tmp` rewrite).
+3. **Crash Assumption on Torn Tails:** Recovery assumes unannounced crashes result in torn tails at the end of the file. If an arbitrary middle-of-file bitflip occurs, recovery halts at that corrupted record.
+4. **Race Detector on Windows:** Running `go test -race` requires a CGO compiler (GCC/MinGW). In pure Go environments without CGO, race-freedom is verified by architectural design (single `sync.RWMutex`, no shared mutable state outside mutex) and high-concurrency stress tests.
 
 ---
 
@@ -133,6 +215,7 @@ Each operation entry:
 - [x] **Step 7:** Atomic multi-operation batch write (`Batch`).
 - [x] **Step 8:** Startup recovery scan & index rebuilding.
 - [x] **Step 9:** Million-key recovery benchmark and performance optimisation.
+- [x] **Step 10:** Final review and verification of database engine invariants.
 
 ---
 
