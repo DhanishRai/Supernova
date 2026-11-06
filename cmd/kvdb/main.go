@@ -73,6 +73,7 @@ func runOpen(args []string) {
 		os.Exit(1)
 	}
 	dbPath := args[0]
+	fmt.Fprintln(os.Stderr, "RECOVERY_SCAN_START")
 
 	start := time.Now()
 	db, err := killitdb.Open(dbPath, defaultMaxBytes)

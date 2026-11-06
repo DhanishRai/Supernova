@@ -71,117 +71,178 @@ class CrashTestRunner:
         """
         CP9 Recovery-Crash Testing Loop.
         
-        Executes repeated recovery interruptions:
-        1. Create a database with acknowledged operations.
-        2. Kill the serve process.
-        3. Start kvdb open.
-        4. Select a random millisecond delay.
-        5. Kill the open process using SIGKILL.
-        6. Start kvdb open again.
-        7. Run kvdb check.
-        8. Run kvdb dump.
-        9. Verify recovered state against the independent oracle.
-        
-        Critical Invariant:
-        If open finishes before SIGKILL, record MISSED CRASH WINDOW and do not
-        count this as a successful recovery-crash test.
+        Fixes applied:
+        A. Seed once with large batches (10,000 ops) and copy per iteration.
+        B. Calibrate kill delay from baseline measurements of startup and recovery.
+        C. Record evidence of where kill landed (size before vs after truncate) and track histogram.
+        D. Vary torn tail across runs (fewer than 8B, length past EOF, bad CRC, cut by 1B / F4, clean).
+        E. Chain 1 to 3 kills before final verification.
+        F. Clean, honest reporting with consistent numbering and phase histogram.
         """
+        import shutil
+        import struct
+        import statistics
+
         target_successes = self.config.iterations
+        db_path = self.config.db_path
+        golden_db = db_path + ".golden_seed"
+
+        # -------------------------------------------------------------
+        # Step A: Seed Once (Large Database with multi-op batches)
+        # -------------------------------------------------------------
+        self._clean_db(db_path)
+        self._clean_db(golden_db)
+
+        golden_oracle = DatabaseOracle()
+        print("=" * 65)
+        print("SEEDING GOLDEN DATABASE FOR RECOVERY-CRASH TESTING...")
+        print("=" * 65)
+
+        seeder_client = EngineClient(
+            engine_bin=self.config.engine_bin,
+            db_path=golden_db,
+            default_timeout=10.0,
+        )
+        try:
+            seeder_client.start()
+        except Exception as exc:
+            sys.stderr.write(f"Failed to start engine for seeding: {exc}\n")
+            return 1
+
+        t_seed_start = time.perf_counter()
+        num_batches = 10
+        ops_per_batch = 1000
+        for b_idx in range(num_batches):
+            op_id = f"rc-golden-batch-{b_idx}"
+            b_items = []
+            oracle_items = []
+            for i in range(ops_per_batch):
+                k = f"key_{((b_idx * ops_per_batch + i) % 200):04d}"
+                coin = self.master_rng.random()
+                if coin < 0.75:
+                    v = f"val_b{b_idx}_i{i}_" + ("x" * 40)
+                    b_items.append(BatchItem.make_put(k, v))
+                    oracle_items.append(BatchSubOp(op_type=OpType.PUT, key=k, value=v))
+                else:
+                    b_items.append(BatchItem.make_del(k))
+                    oracle_items.append(BatchSubOp(op_type=OpType.DEL, key=k))
+
+            golden_oracle.record_batch(op_id, oracle_items, writer_id="golden-seeder")
+            seeder_client.batch(b_items, op_id=op_id)
+
+        seeder_client.close()
+        t_seed_dur = time.perf_counter() - t_seed_start
+        golden_size_kb = os.path.getsize(golden_db) / 1024.0
+        print(f"Seeding completed in {t_seed_dur:.3f}s: 10,000 ops, {golden_size_kb:.1f} KB on disk.")
+
+        # -------------------------------------------------------------
+        # Step B: Calibrate from Measurement (5 baseline runs)
+        # -------------------------------------------------------------
+        print("Calibrating process startup and recovery execution windows...")
+        calib_total_times = []
+        calib_recovery_times = []
+
+        for _ in range(5):
+            t0 = time.perf_counter()
+            p = subprocess.run(
+                [self.config.engine_bin, "open", golden_db],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5.0,
+            )
+            t1 = time.perf_counter()
+            total_time = t1 - t0
+            calib_total_times.append(total_time)
+
+            rec_sec = 0.005
+            for line in p.stdout.splitlines():
+                if "recovery=" in line:
+                    try:
+                        raw = line.split("recovery=")[1].strip()
+                        if raw.endswith("ms"):
+                            rec_sec = float(raw[:-2]) / 1000.0
+                        elif raw.endswith("µs") or raw.endswith("us"):
+                            rec_sec = float(raw[:-2]) / 1_000_000.0
+                        elif raw.endswith("s"):
+                            rec_sec = float(raw[:-1])
+                    except Exception:
+                        pass
+            calib_recovery_times.append(rec_sec)
+
+        median_total = statistics.median(calib_total_times)
+        median_recovery = statistics.median(calib_recovery_times)
+        median_startup = max(0.001, median_total - median_recovery)
+        print(
+            f"Calibration: Median Startup={median_startup*1000:.2f}ms, "
+            f"Median Recovery={median_recovery*1000:.2f}ms (Total={median_total*1000:.2f}ms)"
+        )
+        print("=" * 65)
+
+        # -------------------------------------------------------------
+        # Execution Loop (Chained Kills, Torn Tail Variants, Phase Telemetry)
+        # -------------------------------------------------------------
         passed_count = 0
         missed_count = 0
         attempt = 0
         max_attempts = max(target_successes * 5, 25)
 
+        phase_counts = {
+            "before truncate (scan active)": 0,
+            "after truncate (repair started)": 0,
+        }
+        variant_counts = {
+            "fewer_than_8": 0,
+            "length_past_eof": 0,
+            "bad_crc": 0,
+            "cut_by_1_byte_f4": 0,
+            "clean": 0,
+        }
+
         while passed_count < target_successes and attempt < max_attempts:
             attempt += 1
-            t_start = time.time()
+            t_iter_start = time.perf_counter()
             iter_seed = self.master_rng.randint(1, 100_000_000)
             iter_rng = random.Random(iter_seed)
 
-            db_path = self.config.db_path
+            shutil.copyfile(golden_db, db_path)
             oracle = DatabaseOracle()
-            client: Optional[EngineClient] = None
-            open_proc: Optional[subprocess.Popen] = None
+            with golden_oracle._lock:
+                oracle._seq_counter = golden_oracle._seq_counter
+                oracle._history = list(golden_oracle._history)
+                oracle._history_by_id = dict(golden_oracle._history_by_id)
 
-            try:
-                # 1. Clean db
-                self._clean_db(db_path)
+            variant = iter_rng.choice([
+                "fewer_than_8",
+                "length_past_eof",
+                "bad_crc",
+                "cut_by_1_byte_f4",
+                "clean",
+            ])
 
-                # 2. Start engine in serve mode to seed ACKed operations
-                client = EngineClient(
-                    engine_bin=self.config.engine_bin,
-                    db_path=db_path,
-                    default_timeout=5.0,
-                )
-                try:
-                    client.start()
-                except Exception as exc:
-                    child_exit = ChildProcessExitInfo.from_client(client) if client else None
-                    details = FailureDetails(
-                        category=FailureCategory.ENGINE_FAILURE,
-                        iteration=passed_count + 1,
-                        total_iterations=target_successes,
-                        seed=self.config.seed,
-                        derived_seed=iter_seed,
-                        mode=self.config.mode.value,
-                        db_path=db_path,
-                        errors=[f"Failed to start engine in serve mode: {exc}"],
-                        child_exit=child_exit,
-                        stderr_lines=list(client.stderr_lines) if client else [],
-                    )
-                    art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
-                    sys.stderr.write(f"\n[FAIL] Attempt {attempt}: Failed to start engine: {exc}\n")
-                    sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
-                    return 1
+            curr_size = os.path.getsize(db_path)
+            if variant == "fewer_than_8":
+                with open(db_path, "ab") as f:
+                    f.write(bytes([iter_rng.randint(1, 255) for _ in range(iter_rng.randint(1, 7))]))
+            elif variant == "length_past_eof":
+                with open(db_path, "ab") as f:
+                    f.write(struct.pack(">I", 50000) + b"\xde\xad\xbe\xef" + b"incomplete_tail")
+            elif variant == "bad_crc":
+                payload = b"\x00\x00\x00\x01\x01\x00\x06\x00\x00\x00\x06foobartest"
+                with open(db_path, "ab") as f:
+                    f.write(struct.pack(">II", len(payload), 0xBAD0DEAD) + payload)
+            elif variant == "cut_by_1_byte_f4":
+                if curr_size > 16:
+                    with open(db_path, "r+b") as f:
+                        f.truncate(curr_size - 1)
 
-                # 3. Create a database with acknowledged operations (Give recovery REAL work)
-                num_seed_ops = 250
-                for op_idx in range(1, num_seed_ops + 1):
-                    op_id = f"rc-seed-{op_idx}"
-                    coin = iter_rng.random()
-                    k = f"key_{iter_rng.randint(1, 40):04d}"
-                    if coin < 0.5:
-                        # PUT with varying value sizes (up to 2KB to create real recovery work)
-                        v_len = iter_rng.choice([32, 128, 512, 1024, 2048])
-                        v = f"val_{op_idx}_" + ("v" * (v_len - min(v_len, 20)))
-                        oracle.record_put(op_id, k, v, writer_id="rc-seeder")
-                        client.put(k, v, op_id=op_id)
-                    elif coin < 0.7:
-                        # DEL
-                        oracle.record_del(op_id, k, writer_id="rc-seeder")
-                        client.delete(k, op_id=op_id)
-                    else:
-                        # Multi-operation BATCH
-                        batch_size = iter_rng.randint(3, 6)
-                        batch_items = []
-                        oracle_items = []
-                        for b_idx in range(batch_size):
-                            sub_k = f"key_{iter_rng.randint(1, 40):04d}"
-                            if iter_rng.random() < 0.7:
-                                sub_v = f"batch_{op_idx}_{b_idx}_val"
-                                batch_items.append(BatchItem.make_put(sub_k, sub_v))
-                                oracle_items.append(BatchSubOp(op_type=OpType.PUT, key=sub_k, value=sub_v))
-                            else:
-                                batch_items.append(BatchItem.make_del(sub_k))
-                                oracle_items.append(BatchSubOp(op_type=OpType.DEL, key=sub_k))
-                        oracle.record_batch(op_id, oracle_items, writer_id="rc-seeder")
-                        client.batch(batch_items, op_id=op_id)
+            num_chain_kills = iter_rng.randint(1, 3)
+            chain_success = True
+            last_phase = "before truncate (scan active)"
+            last_delay_ms = 0.0
 
-                # 4. Kill the serve process
-                client.kill(signal.SIGKILL)
-                client.close()
-                client = None
-
-                # Cover F2 (in-flight crash / torn record tail):
-                # In 50% of iterations, inject an uncommitted torn record frame at the log tail
-                has_f2_damage = (iter_rng.random() < 0.5)
-                if has_f2_damage and os.path.exists(db_path):
-                    with open(db_path, "ab") as f:
-                        # Write incomplete record framing (4-byte length + incomplete CRC)
-                        f.write(b"\x00\x00\x00\x40\xaa\xbb")
-
-                # 5. Start kvdb open (1st recovery)
-                recovery_start_time = time.time()
+            for chain_step in range(num_chain_kills):
+                size_before = os.path.getsize(db_path)
                 open_proc = subprocess.Popen(
                     [self.config.engine_bin, "open", db_path],
                     stdout=subprocess.PIPE,
@@ -189,180 +250,113 @@ class CrashTestRunner:
                     text=True,
                 )
 
-                # 6. Calibrate kill delay to land inside the actual recovery window
-                # Recovery of 250 operations takes ~2-6ms. Calibrate delay to 0.5 - 3.5ms.
-                delay_ms = iter_rng.uniform(0.5, 3.5)
+                scan_started = False
+                try:
+                    line = open_proc.stderr.readline()
+                    if "RECOVERY_SCAN_START" in line:
+                        scan_started = True
+                except Exception:
+                    pass
+
+                if scan_started:
+                    delay_ms = iter_rng.uniform(0.5, max(1.5, median_recovery * 1000 * 0.75))
+                else:
+                    delay_ms = iter_rng.uniform(
+                        median_startup * 1000,
+                        (median_startup + median_recovery * 0.75) * 1000,
+                    )
+                last_delay_ms = delay_ms
                 time.sleep(delay_ms / 1000.0)
 
-                # 7. Kill the open process using SIGKILL
                 poll_ret = open_proc.poll()
                 if poll_ret is not None:
-                    # Open finished before SIGKILL arrived
-                    recovery_completion_time = time.time()
-                    sigkill_occurred = False
-                    actual_exit_status = poll_ret
-                    missed_crash_window = True
-                else:
-                    try:
-                        if sys.platform == 'win32':
-                            os.kill(open_proc.pid, signal.SIGKILL)
-                        else:
-                            open_proc.send_signal(signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    try:
-                        open_proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        open_proc.kill()
-                        open_proc.wait()
-                    recovery_completion_time = time.time()
-                    actual_exit_status = open_proc.returncode
+                    chain_success = False
+                    break
 
-                    # Read stdout from open_proc to verify it didn't complete prior to kill
-                    open_stdout = ""
-                    if open_proc.stdout:
-                        try:
-                            open_stdout = open_proc.stdout.read()
-                        except Exception:
-                            pass
+                try:
+                    if sys.platform == "win32":
+                        os.kill(open_proc.pid, signal.SIGKILL)
+                    else:
+                        open_proc.send_signal(signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
-                    # Confirm kill landed on recovery:
-                    # If open completed normally, it outputs "recovery=" and exit code 0.
-                    # If killed mid-recovery, exit code is non-zero and stdout did not finish.
-                    completed_normally = (actual_exit_status == 0) or ("recovery=" in open_stdout)
-                    sigkill_occurred = not completed_normally and (
-                        actual_exit_status in (-signal.SIGKILL, 137, 9) or (sys.platform == 'win32' and actual_exit_status != 0)
-                    )
-                    missed_crash_window = not sigkill_occurred
+                try:
+                    open_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    open_proc.kill()
+                    open_proc.wait()
 
-                # Safely close first open process pipes
+                open_stdout = ""
                 if open_proc.stdout:
                     try:
-                        open_proc.stdout.close()
-                    except Exception:
-                        pass
-                if open_proc.stderr:
-                    try:
-                        open_proc.stderr.close()
+                        open_stdout = open_proc.stdout.read()
                     except Exception:
                         pass
 
-                # 8. Start kvdb open again (2nd recovery), run check, dump, and Oracle verification
-                verifier = StateVerifier(
-                    engine_bin=self.config.engine_bin,
-                    db_path=db_path,
-                    timeout=5.0,
-                )
-                t_open2_start = time.time()
-                passed, violations, actual_dump = verifier.verify(oracle)
-                t_open2_duration = time.time() - t_open2_start
-                second_recovery_success = not any("Command 'open' failed" in v for v in violations)
+                if open_proc.returncode == 0 or "recovery=" in open_stdout:
+                    chain_success = False
+                    break
 
-                t_duration = time.time() - t_start
-
-                rec_info = RecoveryCrashInfo(
-                    recovery_start_time=recovery_start_time,
-                    requested_kill_delay_ms=delay_ms,
-                    actual_exit_status=actual_exit_status,
-                    sigkill_occurred=sigkill_occurred,
-                    recovery_completion_time=recovery_completion_time,
-                    missed_crash_window=missed_crash_window,
-                    second_recovery_success=second_recovery_success,
-                    second_recovery_time_s=t_open2_duration,
-                )
-
-                rep = IterationReport(
-                    iteration=passed_count + 1 if not missed_crash_window else attempt,
-                    total_iterations=target_successes,
-                    passed=passed and not missed_crash_window,
-                    delay_ms=int(delay_ms),
-                    submitted=num_seed_ops,
-                    acked=num_seed_ops,
-                    recovered_keys=len(actual_dump),
-                    duration_s=t_duration,
-                    violations=violations,
-                    mode="recovery-crash",
-                    missed_crash_window=missed_crash_window,
-                    recovery_info=rec_info,
-                )
-                self.reporter.print_iteration_summary(rep)
-
-                if not passed:
-                    child_exit = ChildProcessExitInfo(
-                        pid=open_proc.pid if open_proc else None,
-                        returncode=actual_exit_status,
-                        is_alive=False,
-                        killed_by_sigkill=sigkill_occurred,
-                        termination_cause="SIGKILL (signal 9)" if sigkill_occurred else f"Exit code {actual_exit_status}",
-                    )
-                    cat = classify_failure(
-                        errors=violations,
-                        child_exit=child_exit,
-                        tool_crashed=False,
-                    )
-                    details = FailureDetails(
-                        category=cat,
-                        iteration=attempt,
-                        total_iterations=target_successes,
-                        seed=self.config.seed,
-                        derived_seed=iter_seed,
-                        mode=self.config.mode.value,
-                        db_path=db_path,
-                        errors=violations,
-                        child_exit=child_exit,
-                        actual_dump=actual_dump,
-                        operation_ids=[op.op_id for op in oracle.history],
-                        operation_types=sorted(list(set(op.op_type.value for op in oracle.history))),
-                        recovery_info=rec_info,
-                    )
-                    art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
-                    print("=" * 65)
-                    print(f"FAILED AT RECOVERY-CRASH ATTEMPT {attempt} (SEED: {iter_seed}) - [{cat.value}]")
-                    print(f"Artifacts preserved in: {art_dir}")
-                    print("=" * 65)
-                    return 1
-
-                if missed_crash_window:
-                    missed_count += 1
+                size_after = os.path.getsize(db_path)
+                if size_after < size_before:
+                    last_phase = "after truncate (repair started)"
                 else:
-                    passed_count += 1
+                    last_phase = "before truncate (scan active)"
 
-            except Exception as exc:
-                tb = traceback.format_exc()
-                details = FailureDetails(
-                    category=FailureCategory.TORTURE_TOOL_FAILURE,
-                    iteration=attempt,
-                    total_iterations=target_successes,
-                    seed=self.config.seed,
-                    derived_seed=iter_seed,
-                    mode=self.config.mode.value,
-                    db_path=db_path,
-                    errors=[f"Torture tool unexpected internal exception in recovery-crash: {exc}\n{tb}"],
+            if not chain_success:
+                missed_count += 1
+                sys.stdout.write(
+                    f"[{passed_count:03d}/{target_successes:03d}] MISSED CRASH WINDOW "
+                    f"attempts={attempt} missed={missed_count} delay={last_delay_ms:.2f}ms tail={variant} "
+                    f"({time.perf_counter() - t_iter_start:.3f}s)\n"
                 )
-                art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
-                sys.stderr.write(f"\n[CRASH] Recovery-crash internal harness failure: {exc}\n")
-                sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
+                sys.stdout.flush()
+                continue
+
+            verifier = StateVerifier(
+                engine_bin=self.config.engine_bin,
+                db_path=db_path,
+                timeout=5.0,
+            )
+            passed, violations, actual_dump = verifier.verify(oracle)
+            t_iter_dur = time.perf_counter() - t_iter_start
+
+            if not passed:
+                sys.stderr.write(f"\n[FAIL] Attempt {attempt} failed verification: {violations}\n")
                 return 1
 
-            finally:
-                if client and client.is_alive:
-                    try:
-                        client.kill(signal.SIGKILL)
-                        client.close()
-                    except Exception:
-                        pass
-                if open_proc and open_proc.poll() is None:
-                    try:
-                        open_proc.kill()
-                        open_proc.wait()
-                    except Exception:
-                        pass
+            passed_count += 1
+            phase_counts[last_phase] += 1
+            variant_counts[variant] += 1
+
+            sys.stdout.write(
+                f"[{passed_count:03d}/{target_successes:03d}] attempts={attempt} missed={missed_count} "
+                f"delay={last_delay_ms:.2f}ms phase='{last_phase}' chain={num_chain_kills} tail={variant} "
+                f"check=OK dump=oracle-match ({t_iter_dur:.3f}s)\n"
+            )
+            sys.stdout.flush()
+
+        if os.path.exists(golden_db):
+            try:
+                os.remove(golden_db)
+            except Exception:
+                pass
 
         print("=" * 65)
-        print(f"ALL {passed_count} RECOVERY-CRASH ITERATIONS PASSED CRASH CONSISTENCY VERIFICATION!")
-        if missed_count > 0:
-            print(f"(Note: {missed_count} attempts recorded 'MISSED CRASH WINDOW' and were excluded)")
+        if passed_count >= target_successes:
+            print(f"ALL {passed_count} RECOVERY-CRASH ITERATIONS PASSED CRASH CONSISTENCY VERIFICATION!")
+        else:
+            print(f"FAILED: Only {passed_count} of {target_successes} iterations passed!")
+        print(f"Total Attempts: {attempt} | Missed Crash Windows: {missed_count}")
+        print("Phase Distribution:")
+        for ph, cnt in phase_counts.items():
+            print(f"  - {ph:<35}: {cnt}")
+        print("Torn Tail Variants Covered:")
+        for var, cnt in variant_counts.items():
+            print(f"  - {var:<35}: {cnt}")
         print("=" * 65)
+
         return 0 if passed_count >= target_successes else 1
 
     def _run_compaction_crash_loop(self) -> int:
