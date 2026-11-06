@@ -316,3 +316,318 @@ func TestEncodeRecord_MaxAllowedBatch(t *testing.T) {
 		t.Fatalf("expected opCount %d, got %d", MaxBatchOps, opCount)
 	}
 }
+
+// craftRecord creates a properly framed record with valid CRC for testing internal payload validation.
+func craftRecord(payload []byte) []byte {
+	buf := make([]byte, RecordHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
+	copy(buf[RecordHeaderSize:], payload)
+
+	h := crc32.NewIEEE()
+	h.Write(buf[0:4])
+	h.Write(buf[RecordHeaderSize:])
+	binary.LittleEndian.PutUint32(buf[4:8], h.Sum32())
+	return buf
+}
+
+func TestDecodeRecord_RoundTrip(t *testing.T) {
+	origOps := []Operation{
+		{Type: OpPut, Key: []byte("user:101"), Value: []byte("Alice")},
+		{Type: OpPut, Key: []byte("user:102"), Value: []byte("Bob")},
+		{Type: OpDelete, Key: []byte("user:100"), Value: nil},
+		{Type: OpPut, Key: []byte("flag:active"), Value: []byte{}},
+	}
+
+	buf, err := encodeRecord(origOps)
+	if err != nil {
+		t.Fatalf("encodeRecord failed: %v", err)
+	}
+
+	decodedOps, err := decodeRecord(buf)
+	if err != nil {
+		t.Fatalf("decodeRecord failed: %v", err)
+	}
+
+	if len(decodedOps) != len(origOps) {
+		t.Fatalf("expected %d ops, got %d", len(origOps), len(decodedOps))
+	}
+
+	for i := range origOps {
+		if decodedOps[i].Type != origOps[i].Type {
+			t.Errorf("op[%d] type mismatch: expected %d, got %d", i, origOps[i].Type, decodedOps[i].Type)
+		}
+		if !bytes.Equal(decodedOps[i].Key, origOps[i].Key) {
+			t.Errorf("op[%d] key mismatch: expected %s, got %s", i, origOps[i].Key, decodedOps[i].Key)
+		}
+		if !bytes.Equal(decodedOps[i].Value, origOps[i].Value) {
+			t.Errorf("op[%d] value mismatch: expected %s, got %s", i, origOps[i].Value, decodedOps[i].Value)
+		}
+	}
+}
+
+func TestDecodeRecord_TruncatedHeader(t *testing.T) {
+	shortBuffers := [][]byte{
+		{},
+		{0x01},
+		{0x01, 0x02, 0x03, 0x04},
+		{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+	}
+
+	for _, buf := range shortBuffers {
+		_, err := decodeRecord(buf)
+		if !errors.Is(err, ErrRecordTooShort) {
+			t.Fatalf("expected ErrRecordTooShort for len %d, got %v", len(buf), err)
+		}
+	}
+}
+
+func TestDecodeRecord_CorruptedLength(t *testing.T) {
+	origOps := []Operation{
+		{Type: OpPut, Key: []byte("k"), Value: []byte("v")},
+	}
+	buf, err := encodeRecord(origOps)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	// Tamper payload length to be larger than buffer
+	tamperedBuf := make([]byte, len(buf))
+	copy(tamperedBuf, buf)
+	binary.LittleEndian.PutUint32(tamperedBuf[0:4], binary.LittleEndian.Uint32(buf[0:4])+10)
+
+	_, err = decodeRecord(tamperedBuf)
+	if !errors.Is(err, ErrRecordSizeMismatch) {
+		t.Fatalf("expected ErrRecordSizeMismatch, got %v", err)
+	}
+
+	// Tamper payload length to be smaller than buffer
+	copy(tamperedBuf, buf)
+	binary.LittleEndian.PutUint32(tamperedBuf[0:4], binary.LittleEndian.Uint32(buf[0:4])-2)
+
+	_, err = decodeRecord(tamperedBuf)
+	if !errors.Is(err, ErrRecordSizeMismatch) {
+		t.Fatalf("expected ErrRecordSizeMismatch, got %v", err)
+	}
+}
+
+func TestDecodeRecord_CorruptedCRC(t *testing.T) {
+	ops := []Operation{
+		{Type: OpPut, Key: []byte("safe-key"), Value: []byte("safe-val")},
+	}
+	buf, err := encodeRecord(ops)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	// Corrupt one bit in CRC field
+	tampered := make([]byte, len(buf))
+	copy(tampered, buf)
+	tampered[4] ^= 0x01
+
+	_, err = decodeRecord(tampered)
+	if !errors.Is(err, ErrCRCMismatch) {
+		t.Fatalf("expected ErrCRCMismatch, got %v", err)
+	}
+
+	// Corrupt one bit in payload body without updating CRC
+	tamperedPayload := make([]byte, len(buf))
+	copy(tamperedPayload, buf)
+	tamperedPayload[len(tamperedPayload)-1] ^= 0x01
+
+	_, err = decodeRecord(tamperedPayload)
+	if !errors.Is(err, ErrCRCMismatch) {
+		t.Fatalf("expected ErrCRCMismatch on tampered payload, got %v", err)
+	}
+}
+
+func TestDecodeRecord_TruncatedPayload(t *testing.T) {
+	ops := []Operation{
+		{Type: OpPut, Key: []byte("long-key"), Value: []byte("long-val-body")},
+	}
+	buf, err := encodeRecord(ops)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	// Slice off the last 5 bytes without altering header
+	truncated := buf[:len(buf)-5]
+	_, err = decodeRecord(truncated)
+	if !errors.Is(err, ErrRecordSizeMismatch) {
+		t.Fatalf("expected ErrRecordSizeMismatch on truncated record, got %v", err)
+	}
+
+	// Payload with truncated operation count (< 4 bytes) but valid CRC
+	shortPayload := craftRecord([]byte{0x01, 0x02})
+	_, err = decodeRecord(shortPayload)
+	if !errors.Is(err, ErrTruncatedPayload) {
+		t.Fatalf("expected ErrTruncatedPayload for <4 byte payload, got %v", err)
+	}
+
+	// Payload with opCount=1 but no operation header bytes
+	opCountOnly := make([]byte, 4)
+	binary.LittleEndian.PutUint32(opCountOnly, 1)
+	partialOp := craftRecord(opCountOnly)
+	_, err = decodeRecord(partialOp)
+	if !errors.Is(err, ErrTruncatedPayload) {
+		t.Fatalf("expected ErrTruncatedPayload for missing op body, got %v", err)
+	}
+}
+
+func TestDecodeRecord_InvalidOperationType(t *testing.T) {
+	// opCount=1, type=99 (invalid), keyLen=2, valLen=2, key="ab", val="cd"
+	payload := make([]byte, 4+OpHeaderSize+4)
+	binary.LittleEndian.PutUint32(payload[0:4], 1)
+	payload[4] = 99 // Invalid op type
+	binary.LittleEndian.PutUint16(payload[5:7], 2)
+	binary.LittleEndian.PutUint32(payload[7:11], 2)
+	copy(payload[11:13], "ab")
+	copy(payload[13:15], "cd")
+
+	record := craftRecord(payload)
+	_, err := decodeRecord(record)
+	if !errors.Is(err, ErrInvalidOpType) {
+		t.Fatalf("expected ErrInvalidOpType, got %v", err)
+	}
+}
+
+func TestDecodeRecord_InvalidOperationCount(t *testing.T) {
+	// opCount = 0
+	payloadZero := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payloadZero, 0)
+	recordZero := craftRecord(payloadZero)
+	_, err := decodeRecord(recordZero)
+	if !errors.Is(err, ErrEmptyBatch) {
+		t.Fatalf("expected ErrEmptyBatch for opCount 0, got %v", err)
+	}
+
+	// opCount = 10,001
+	payloadTooMany := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payloadTooMany, MaxBatchOps+1)
+	recordTooMany := craftRecord(payloadTooMany)
+	_, err = decodeRecord(recordTooMany)
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("expected ErrBatchTooLarge for opCount %d, got %v", MaxBatchOps+1, err)
+	}
+}
+
+func TestDecodeRecord_InvalidKeyLength(t *testing.T) {
+	// keyLen = 0
+	payloadZeroKey := make([]byte, 4+OpHeaderSize)
+	binary.LittleEndian.PutUint32(payloadZeroKey[0:4], 1)
+	payloadZeroKey[4] = byte(OpPut)
+	binary.LittleEndian.PutUint16(payloadZeroKey[5:7], 0) // keyLen = 0
+	binary.LittleEndian.PutUint32(payloadZeroKey[7:11], 0)
+
+	recordZeroKey := craftRecord(payloadZeroKey)
+	_, err := decodeRecord(recordZeroKey)
+	if !errors.Is(err, ErrInvalidKeyLength) {
+		t.Fatalf("expected ErrInvalidKeyLength for keyLen 0, got %v", err)
+	}
+
+	// keyLen = 1025 (exceeds MaxKeyLen)
+	payloadLongKey := make([]byte, 4+OpHeaderSize)
+	binary.LittleEndian.PutUint32(payloadLongKey[0:4], 1)
+	payloadLongKey[4] = byte(OpPut)
+	binary.LittleEndian.PutUint16(payloadLongKey[5:7], MaxKeyLen+1) // 1025
+	binary.LittleEndian.PutUint32(payloadLongKey[7:11], 0)
+
+	recordLongKey := craftRecord(payloadLongKey)
+	_, err = decodeRecord(recordLongKey)
+	if !errors.Is(err, ErrInvalidKeyLength) {
+		t.Fatalf("expected ErrInvalidKeyLength for keyLen 1025, got %v", err)
+	}
+}
+
+func TestDecodeRecord_InvalidValueLength(t *testing.T) {
+	// valLen = MaxValueLen + 1
+	payloadLongVal := make([]byte, 4+OpHeaderSize+1)
+	binary.LittleEndian.PutUint32(payloadLongVal[0:4], 1)
+	payloadLongVal[4] = byte(OpPut)
+	binary.LittleEndian.PutUint16(payloadLongVal[5:7], 1)
+	binary.LittleEndian.PutUint32(payloadLongVal[7:11], MaxValueLen+1)
+	payloadLongVal[11] = 'k'
+
+	recordLongVal := craftRecord(payloadLongVal)
+	_, err := decodeRecord(recordLongVal)
+	if !errors.Is(err, ErrInvalidValueLength) {
+		t.Fatalf("expected ErrInvalidValueLength, got %v", err)
+	}
+
+	// DELETE with non-zero value length
+	payloadDeleteVal := make([]byte, 4+OpHeaderSize+2)
+	binary.LittleEndian.PutUint32(payloadDeleteVal[0:4], 1)
+	payloadDeleteVal[4] = byte(OpDelete)
+	binary.LittleEndian.PutUint16(payloadDeleteVal[5:7], 1)
+	binary.LittleEndian.PutUint32(payloadDeleteVal[7:11], 1) // Non-zero valLen for DELETE
+	payloadDeleteVal[11] = 'k'
+	payloadDeleteVal[12] = 'v'
+
+	recordDeleteVal := craftRecord(payloadDeleteVal)
+	_, err = decodeRecord(recordDeleteVal)
+	if !errors.Is(err, ErrDeleteWithValue) {
+		t.Fatalf("expected ErrDeleteWithValue for DELETE with value, got %v", err)
+	}
+}
+
+func TestDecodeRecord_ExtraTrailingBytes(t *testing.T) {
+	ops := []Operation{
+		{Type: OpPut, Key: []byte("k"), Value: []byte("v")},
+	}
+	buf, err := encodeRecord(ops)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	// Append unexpected trailing bytes to outer record
+	withTrailing := append(buf, 0xAA, 0xBB, 0xCC)
+	_, err = decodeRecord(withTrailing)
+	if !errors.Is(err, ErrRecordSizeMismatch) {
+		t.Fatalf("expected ErrRecordSizeMismatch for trailing bytes on outer record, got %v", err)
+	}
+
+	// Craft payload with valid opCount=1, valid op, but trailing garbage bytes inside payload
+	payload := make([]byte, 4+OpHeaderSize+2+3) // 3 extra bytes
+	binary.LittleEndian.PutUint32(payload[0:4], 1)
+	payload[4] = byte(OpPut)
+	binary.LittleEndian.PutUint16(payload[5:7], 1)
+	binary.LittleEndian.PutUint32(payload[7:11], 1)
+	payload[11] = 'k'
+	payload[12] = 'v'
+	payload[13] = 0xDE
+	payload[14] = 0xAD
+	payload[15] = 0xBE
+
+	record := craftRecord(payload)
+	_, err = decodeRecord(record)
+	if !errors.Is(err, ErrTrailingData) {
+		t.Fatalf("expected ErrTrailingData for payload with internal trailing bytes, got %v", err)
+	}
+}
+
+func TestDecodeRecord_EmptyPutValue(t *testing.T) {
+	ops := []Operation{
+		{Type: OpPut, Key: []byte("key-with-empty-val"), Value: []byte{}},
+	}
+	buf, err := encodeRecord(ops)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	decoded, err := decodeRecord(buf)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	if len(decoded) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(decoded))
+	}
+	if decoded[0].Type != OpPut {
+		t.Fatalf("expected OpPut, got %d", decoded[0].Type)
+	}
+	if string(decoded[0].Key) != "key-with-empty-val" {
+		t.Fatalf("expected key 'key-with-empty-val', got '%s'", string(decoded[0].Key))
+	}
+	if len(decoded[0].Value) != 0 {
+		t.Fatalf("expected empty value, got %v", decoded[0].Value)
+	}
+}

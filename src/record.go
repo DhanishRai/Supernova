@@ -53,6 +53,16 @@ var (
 	ErrInvalidOpType = errors.New("invalid operation type")
 	// ErrPayloadTooLarge indicates the total payload size exceeds uint32 limit.
 	ErrPayloadTooLarge = errors.New("payload length exceeds maximum allowed uint32")
+	// ErrRecordTooShort indicates data is smaller than the 8-byte outer record header.
+	ErrRecordTooShort = errors.New("record data too short for outer header")
+	// ErrRecordSizeMismatch indicates data length does not match payload length + 8.
+	ErrRecordSizeMismatch = errors.New("record data size does not match specified payload length")
+	// ErrCRCMismatch indicates record CRC32 does not match payload checksum.
+	ErrCRCMismatch = errors.New("record CRC32 checksum mismatch")
+	// ErrTruncatedPayload indicates the payload ends before all declared fields could be read.
+	ErrTruncatedPayload = errors.New("payload is truncated")
+	// ErrTrailingData indicates extra bytes remain in the payload after decoding all declared operations.
+	ErrTrailingData = errors.New("payload contains unexpected trailing data")
 )
 
 // Operation represents a single PUT or DELETE mutation.
@@ -173,4 +183,117 @@ func encodeRecord(ops []Operation) ([]byte, error) {
 	binary.LittleEndian.PutUint32(buf[4:8], checksum)
 
 	return buf, nil
+}
+
+// decodeRecord decodes and validates a complete binary record:
+//
+// 1. Validates that at least 8 bytes exist for the outer header.
+// 2. Reads payload length and checks for integer overflow.
+// 3. Verifies that data contains exactly RecordHeaderSize + payloadLength bytes.
+// 4. Verifies the IEEE CRC32 checksum over the 4 payload length bytes + payload.
+// 5. Decodes and bounds-checks operation count (1–10,000).
+// 6. Decodes each operation with strict boundary checks on type, key length, and value length.
+// 7. Confirms no unexpected trailing bytes remain in the payload.
+//
+// The function does not trust any lengths in data and strictly validates bounds
+// before allocating or slicing memory.
+func decodeRecord(data []byte) ([]Operation, error) {
+	if len(data) < RecordHeaderSize {
+		return nil, ErrRecordTooShort
+	}
+
+	payloadLen := binary.LittleEndian.Uint32(data[0:4])
+	expectedTotalSize := uint64(RecordHeaderSize) + uint64(payloadLen)
+
+	if expectedTotalSize > math.MaxUint32 || uint64(len(data)) != expectedTotalSize {
+		return nil, ErrRecordSizeMismatch
+	}
+
+	// Validate CRC32
+	expectedCRC := binary.LittleEndian.Uint32(data[4:8])
+	hasher := crc32.NewIEEE()
+	hasher.Write(data[0:4])
+	hasher.Write(data[RecordHeaderSize:])
+	if hasher.Sum32() != expectedCRC {
+		return nil, ErrCRCMismatch
+	}
+
+	// Payload must contain at least 4 bytes for operation count.
+	if payloadLen < 4 {
+		return nil, ErrTruncatedPayload
+	}
+
+	payloadOffset := RecordHeaderSize
+	opCount := binary.LittleEndian.Uint32(data[payloadOffset : payloadOffset+4])
+	payloadOffset += 4
+
+	if opCount < MinBatchOps {
+		return nil, ErrEmptyBatch
+	}
+	if opCount > MaxBatchOps {
+		return nil, ErrBatchTooLarge
+	}
+
+	payloadEnd := len(data)
+	ops := make([]Operation, 0, opCount)
+
+	for i := uint32(0); i < opCount; i++ {
+		// Must have at least OpHeaderSize (7 bytes)
+		if payloadEnd-payloadOffset < OpHeaderSize {
+			return nil, ErrTruncatedPayload
+		}
+
+		opType := OperationType(data[payloadOffset])
+		payloadOffset++
+
+		if opType != OpPut && opType != OpDelete {
+			return nil, ErrInvalidOpType
+		}
+
+		keyLen := binary.LittleEndian.Uint16(data[payloadOffset : payloadOffset+2])
+		payloadOffset += 2
+
+		if keyLen < MinKeyLen || keyLen > MaxKeyLen {
+			return nil, ErrInvalidKeyLength
+		}
+
+		valLen := binary.LittleEndian.Uint32(data[payloadOffset : payloadOffset+4])
+		payloadOffset += 4
+
+		if valLen > MaxValueLen {
+			return nil, ErrInvalidValueLength
+		}
+
+		if opType == OpDelete && valLen != 0 {
+			return nil, ErrDeleteWithValue
+		}
+
+		opDataLen := uint64(keyLen) + uint64(valLen)
+		if uint64(payloadEnd-payloadOffset) < opDataLen {
+			return nil, ErrTruncatedPayload
+		}
+
+		key := make([]byte, keyLen)
+		copy(key, data[payloadOffset:payloadOffset+int(keyLen)])
+		payloadOffset += int(keyLen)
+
+		var val []byte
+		if valLen > 0 {
+			val = make([]byte, valLen)
+			copy(val, data[payloadOffset:payloadOffset+int(valLen)])
+			payloadOffset += int(valLen)
+		}
+
+		ops = append(ops, Operation{
+			Type:  opType,
+			Key:   key,
+			Value: val,
+		})
+	}
+
+	if payloadOffset != payloadEnd {
+		return nil, ErrTrailingData
+	}
+
+	return ops, nil
 }

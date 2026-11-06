@@ -18,12 +18,18 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 1 complete
+- **Status:** Step 2 complete
 - **Engine Core:**
-  - Record data structures (`OperationType`, `Operation`) and constants implemented.
+  - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
   - IEEE CRC32 checksum generation implemented covering payload length and payload bytes.
-  - Comprehensive unit test suite covering single/multi-op encoding, bounds checking, and bit-flip CRC verification.
+  - Binary record decoder (`decodeRecord`) implemented with defensive bounds checking before reading/allocating:
+    - Verifies outer record length (at least 8 bytes) and exact payload size match.
+    - Validates IEEE CRC32 checksum over payload length and payload bytes.
+    - Validates operation count (1–10,000), operation types, key lengths (1–1024), and value lengths (0–1 MB).
+    - Enforces zero-length values for DELETE operations.
+    - Rejects truncated headers, truncated payloads, and unexpected trailing bytes.
+  - Comprehensive unit test suite (24 tests) covering encoding, decoding, round-trip serialization, corruption detection, and boundary conditions.
 
 ---
 
@@ -75,13 +81,14 @@ Each operation entry:
 ## Engine Implementation Roadmap
 
 - [x] **Step 0:** Inspect and prepare Go project, toolchain, git repository, and documentation.
-- [x] **Step 1:** Binary constants, record header structures, serialization & CRC32 calculation.
-- [ ] **Step 2:** File initialization, header validation, and open/close lifecycle.
-- [ ] **Step 3:** Record append, fsync durability, and rollback on failed write.
-- [ ] **Step 4:** In-memory index, startup recovery scan, and CRC validation.
-- [ ] **Step 5:** Read path (`Get`) using disk offset indexing (`ReadAt`).
-- [ ] **Step 6:** Public API (`Open`, `Put`, `Get`, `Delete`, `Batch`, `Close`) & concurrency with `sync.RWMutex`.
-- [ ] **Step 7:** Crash safety verification, boundary torture testing, and recovery guarantees.
+- [x] **Step 1:** Binary constants, record header structures, serialization (`encodeRecord`) & CRC32 calculation.
+- [x] **Step 2:** Binary record deserialization (`decodeRecord`), CRC validation, bounds checking & round-trip verification.
+- [ ] **Step 3:** File header structure (16 bytes), file initialization, header validation, and open/close lifecycle.
+- [ ] **Step 4:** Record append, fsync durability, and rollback on failed write.
+- [ ] **Step 5:** In-memory index, startup recovery scan, and CRC validation.
+- [ ] **Step 6:** Read path (`Get`) using disk offset indexing (`ReadAt`).
+- [ ] **Step 7:** Public API (`Open`, `Put`, `Get`, `Delete`, `Batch`, `Close`) & concurrency with `sync.RWMutex`.
+- [ ] **Step 8:** Crash safety verification, boundary torture testing, and recovery guarantees.
 
 ---
 
