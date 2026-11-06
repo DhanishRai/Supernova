@@ -28,6 +28,14 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - **Resilience**: Full detection of unknown IDs, malformed responses, broken pipes, unexpected EOF on crash, timeouts, and orphan cleanup via `SIGKILL`.
 - **`tests/fake_engine.py`**: Controllable mock engine process simulating `./kvdb serve` for deterministic edge-case testing.
 
+### CP3: The Independent Oracle
+- **`oracle.py`**: Thread-safe ground truth state model:
+  - **Zero Trust**: Completely independent from the database file and engine dump.
+  - **Full Provenance**: Tracks `op_id`, sequence number, writer thread, and exact state transitions for every key.
+  - **Definite vs Permissible States**: Models both durable guaranteed state (all ACKed operations) and valid crash transition states (unACKed operations).
+  - **Batch Atomicity Verification**: Collapses repeated sub-operations within batches to verify net all-or-nothing visibility.
+  - **Integrity Validation**: Detects alien, corrupted, or unwritten values.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

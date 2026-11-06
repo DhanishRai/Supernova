@@ -430,3 +430,102 @@ Ask:
 
 STOP after CP1.
 ```
+
+
+---
+
+### Entry 4
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:06:45 IST
+- **Development Stage**: CP3 (The Independent Oracle)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP3: the independent oracle.
+
+This is one of the most important components of the entire project.
+
+OBJECTIVE:
+
+Build an independent model of the database state.
+
+The oracle must never use the database dump to calculate expected state.
+
+STORE:
+
+- Operation ID.
+- Operation type.
+- Key.
+- Value.
+- Batch contents.
+- Submission sequence.
+- ACK status.
+- ERR status.
+- Writer information.
+
+SUPPORT:
+
+PUT
+DEL
+BATCH
+
+RULES:
+
+1. Every ACKed operation must be reflected in recovered state.
+2. Unacknowledged operations may be fully present or absent.
+3. Unacknowledged batches must be fully present or fully absent.
+4. Batches must be atomic.
+5. Repeated keys must be handled correctly.
+6. Deletes must be represented correctly.
+
+CRITICAL ORDERING:
+
+Inspect the engine's operation-processing guarantees.
+
+Do not assume submission order equals commit order.
+
+For this initial stage, use a single writer.
+
+Establish whether the CLI processes input sequentially.
+
+If ordering guarantees cannot be verified, report the ambiguity.
+
+Do not invent guarantees.
+
+IMPLEMENT:
+
+Create torture/oracle.py.
+
+Use locks where required.
+
+Maintain operation history.
+
+Preserve enough information to identify which operation IDs produced each final value.
+
+TEST:
+
+1. ACKed PUT.
+2. ACKed DEL.
+3. ACKed BATCH.
+4. Unacknowledged PUT.
+5. Unacknowledged BATCH.
+6. Repeated overwrites.
+7. Delete followed by PUT.
+8. Batch with repeated keys.
+9. Multiple writes to the same key.
+
+For each test explain:
+
+"What bug would this check catch, and what bug could slip past it?"
+
+GIT COMMIT:
+
+track acknowledged writes
+
+STOP after CP3.
+```
