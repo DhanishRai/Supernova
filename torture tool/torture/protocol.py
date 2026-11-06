@@ -546,7 +546,7 @@ class EngineClient:
 
         try:
             os.kill(self._proc.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass  # Already terminated
 
         try:

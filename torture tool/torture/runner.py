@@ -203,7 +203,7 @@ class CrashTestRunner:
                             os.kill(open_proc.pid, signal.SIGKILL)
                         else:
                             open_proc.send_signal(signal.SIGKILL)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
                     try:
                         open_proc.wait(timeout=2.0)
