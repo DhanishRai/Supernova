@@ -199,7 +199,10 @@ class CrashTestRunner:
                     missed_crash_window = True
                 else:
                     try:
-                        open_proc.send_signal(signal.SIGKILL)
+                        if sys.platform == 'win32':
+                            os.kill(open_proc.pid, signal.SIGKILL)
+                        else:
+                            open_proc.send_signal(signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     try:
