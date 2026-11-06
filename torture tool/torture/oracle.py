@@ -90,6 +90,8 @@ class OperationRecord:
     key: Optional[str] = None
     value: Optional[str] = None
     batch_items: Tuple[BatchSubOp, ...] = field(default_factory=tuple)
+    batch_puts: Dict[str, str] = field(default_factory=dict)
+    batch_dels: Set[str] = field(default_factory=set)
     acked: bool = False
     errored: bool = False
     error_message: Optional[str] = None
@@ -141,14 +143,16 @@ class DatabaseOracle:
         self._seq_counter = 0
         self._history: List[OperationRecord] = []
         self._history_by_id: Dict[str, OperationRecord] = {}
+        self._historical_values_per_key: Dict[str, Set[str]] = {}
 
     def clone(self) -> "DatabaseOracle":
         """Returns an independent deep copy of the Oracle and its operation history."""
         with self._lock:
             cp = DatabaseOracle()
             cp._seq_counter = self._seq_counter
-            cp._history = [replace(r) for r in self._history]
+            cp._history = [replace(r, batch_puts=dict(r.batch_puts), batch_dels=set(r.batch_dels)) for r in self._history]
             cp._history_by_id = {r.op_id: r for r in cp._history}
+            cp._historical_values_per_key = {k: set(v) for k, v in self._historical_values_per_key.items()}
             return cp
 
     @property
@@ -184,6 +188,7 @@ class DatabaseOracle:
             )
             self._history.append(rec)
             self._history_by_id[op_id] = rec
+            self._historical_values_per_key.setdefault(key, set()).add(value)
             return rec
 
     def record_del(
@@ -222,6 +227,15 @@ class DatabaseOracle:
             if not items:
                 raise ValueError("Batch items cannot be empty")
             self._seq_counter += 1
+            b_puts: Dict[str, str] = {}
+            b_dels: Set[str] = set()
+            for s in items:
+                if s.op_type == OpType.PUT and s.value is not None:
+                    b_puts[s.key] = s.value
+                    self._historical_values_per_key.setdefault(s.key, set()).add(s.value)
+                elif s.op_type == OpType.DEL:
+                    b_dels.add(s.key)
+
             rec = OperationRecord(
                 op_id=op_id,
                 op_type=OpType.BATCH,
@@ -229,6 +243,8 @@ class DatabaseOracle:
                 writer_id=writer_id,
                 submitted_at=time.time(),
                 batch_items=tuple(items),
+                batch_puts=b_puts,
+                batch_dels=b_dels,
             )
             self._history.append(rec)
             self._history_by_id[op_id] = rec
@@ -372,16 +388,14 @@ class DatabaseOracle:
             unacked_discarded: List[str] = []
 
             # 1. Collect all valid historical values ever written per key
-            historical_values_per_key: Dict[str, Set[str]] = {}
+            historical_values_per_key = {k: set(v) for k, v in self._historical_values_per_key.items()}
             for op in self._history:
                 if op.errored:
-                    continue
-                if op.op_type == OpType.PUT and op.key and op.value:
-                    historical_values_per_key.setdefault(op.key, set()).add(op.value)
-                elif op.op_type == OpType.BATCH:
-                    for sub in op.batch_items:
-                        if sub.op_type == OpType.PUT and sub.value:
-                            historical_values_per_key.setdefault(sub.key, set()).add(sub.value)
+                    if op.op_type == OpType.PUT and op.key and op.value:
+                        historical_values_per_key.get(op.key, set()).discard(op.value)
+                    elif op.op_type == OpType.BATCH:
+                        for k, v in op.batch_puts.items():
+                            historical_values_per_key.get(k, set()).discard(v)
 
             # 2. Check Data Integrity: No key may hold a value never written to that key
             for key, val in actual_dump.items():
@@ -400,8 +414,8 @@ class DatabaseOracle:
                 if op.key:
                     unacked_keys.add(op.key)
                 if op.op_type == OpType.BATCH:
-                    for sub in op.batch_items:
-                        unacked_keys.add(sub.key)
+                    unacked_keys.update(op.batch_puts.keys())
+                    unacked_keys.update(op.batch_dels)
 
             # Helper to check if two operations were concurrent in-flight
             def were_concurrent(op1: OperationRecord, op2: OperationRecord) -> bool:
@@ -422,7 +436,7 @@ class DatabaseOracle:
 
                     can_be_deleted = any(
                         (op.op_type == OpType.DEL and op.key == key) or
-                        (op.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == key for s in op.batch_items))
+                        (op.op_type == OpType.BATCH and key in op.batch_dels)
                         for op in unacked_ops
                     )
                     if not can_be_deleted and last_op is not None:
@@ -430,7 +444,7 @@ class DatabaseOracle:
                         can_be_deleted = any(
                             (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
                                 (o.op_type == OpType.DEL and o.key == key) or
-                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == key for s in o.batch_items))
+                                (o.op_type == OpType.BATCH and key in o.batch_dels)
                             ))
                             for o in self._history
                         )
@@ -451,14 +465,14 @@ class DatabaseOracle:
                         # b) A concurrent ACKed write overlapped and committed second.
                         can_be_overwritten = any(
                             (op.op_type == OpType.PUT and op.key == key and op.value == actual_val) or
-                            (op.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in op.batch_items))
+                            (op.op_type == OpType.BATCH and op.batch_puts.get(key) == actual_val)
                             for op in unacked_ops
                         )
                         if not can_be_overwritten and last_op is not None:
                             can_be_overwritten = any(
                                 (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
                                     (o.op_type == OpType.PUT and o.key == key and o.value == actual_val) or
-                                    (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in o.batch_items))
+                                    (o.op_type == OpType.BATCH and o.batch_puts.get(key) == actual_val)
                                 ))
                                 for o in self._history
                             )
@@ -478,14 +492,14 @@ class DatabaseOracle:
 
                     can_be_recreated = any(
                         (op.op_type == OpType.PUT and op.key == key and op.value == actual_val) or
-                        (op.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in op.batch_items))
+                        (op.op_type == OpType.BATCH and op.batch_puts.get(key) == actual_val)
                         for op in unacked_ops
                     )
                     if not can_be_recreated and last_op is not None:
                         can_be_recreated = any(
                             (o.acked and o.op_id != last_op.op_id and were_concurrent(o, last_op) and (
                                 (o.op_type == OpType.PUT and o.key == key and o.value == actual_val) or
-                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == key and s.value == actual_val for s in o.batch_items))
+                                (o.op_type == OpType.BATCH and o.batch_puts.get(key) == actual_val)
                             ))
                             for o in self._history
                         )
@@ -496,25 +510,26 @@ class DatabaseOracle:
                             f"but is still present with value {format_val_summary(actual_val)}!"
                         )
 
-            # Helper to compute definite state prior to a given operation sequence
+            # Helper to compute definite state prior to a given operation sequence in single O(N) pass
+            states_before: Dict[int, Dict[str, str]] = {}
+            running_state: Dict[str, str] = {}
+            for o in self._history:
+                states_before[o.seq] = dict(running_state)
+                if not o.acked:
+                    continue
+                if o.op_type == OpType.PUT and o.key and o.value:
+                    running_state[o.key] = o.value
+                elif o.op_type == OpType.DEL and o.key:
+                    running_state.pop(o.key, None)
+                elif o.op_type == OpType.BATCH:
+                    for s in o.batch_items:
+                        if s.op_type == OpType.PUT and s.value:
+                            running_state[s.key] = s.value
+                        elif s.op_type == OpType.DEL:
+                            running_state.pop(s.key, None)
+
             def get_state_before(target_seq: int) -> Dict[str, str]:
-                st: Dict[str, str] = {}
-                for o in self._history:
-                    if o.seq >= target_seq:
-                        break
-                    if not o.acked:
-                        continue
-                    if o.op_type == OpType.PUT and o.key and o.value:
-                        st[o.key] = o.value
-                    elif o.op_type == OpType.DEL and o.key:
-                        st.pop(o.key, None)
-                    elif o.op_type == OpType.BATCH:
-                        for s in o.batch_items:
-                            if s.op_type == OpType.PUT and s.value:
-                                st[s.key] = s.value
-                            elif s.op_type == OpType.DEL:
-                                st.pop(s.key, None)
-                return st
+                return states_before.get(target_seq, {})
 
             # 5. Check Batch Atomicity for all batches (ACKed and unACKed)
             for op in self._history:
@@ -560,7 +575,7 @@ class DatabaseOracle:
                                 other_writers = any(
                                     o.op_id != op.op_id and (
                                         (o.op_type == OpType.PUT and o.key == sub_k and o.value == sub_op.value) or
-                                        (o.op_type == OpType.BATCH and any(s.key == sub_k and s.value == sub_op.value for s in o.batch_items))
+                                        (o.op_type == OpType.BATCH and o.batch_puts.get(sub_k) == sub_op.value)
                                     )
                                     for o in self._history
                                 )
@@ -574,7 +589,7 @@ class DatabaseOracle:
                             can_be_overwritten = any(
                                 o.op_id != op.op_id and (o.seq > op.seq or were_concurrent(o, op)) and (
                                     o.key == sub_k or
-                                    (o.op_type == OpType.BATCH and any(s.key == sub_k for s in o.batch_items))
+                                    (o.op_type == OpType.BATCH and (sub_k in o.batch_puts or sub_k in o.batch_dels))
                                 )
                                 for o in self._history
                             )
@@ -608,7 +623,7 @@ class DatabaseOracle:
                         valid_explanation = any(
                             o.op_id != op.op_id and not o.errored and (
                                 (o.op_type == OpType.PUT and o.key == op.key and o.value == op.value) or
-                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == op.key and s.value == op.value for s in o.batch_items))
+                                (o.op_type == OpType.BATCH and o.batch_puts.get(op.key) == op.value)
                             ) and (
                                 (o.seq < op.seq and o.op_id in unacked_committed) or
                                 (o.seq > op.seq or were_concurrent(o, op))
@@ -627,7 +642,7 @@ class DatabaseOracle:
                         valid_del = any(
                             o.op_id != op.op_id and not o.errored and (
                                 (o.op_type == OpType.DEL and o.key == op.key) or
-                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == op.key for s in o.batch_items))
+                                (o.op_type == OpType.BATCH and op.key in o.batch_dels)
                             ) and (
                                 (o.seq < op.seq and o.op_id in unacked_committed) or
                                 (o.seq > op.seq or were_concurrent(o, op))
@@ -648,7 +663,7 @@ class DatabaseOracle:
                                 valid_explanation = any(
                                     o.op_id != op.op_id and not o.errored and (
                                         (o.op_type == OpType.PUT and o.key == sub.key and o.value == sub.value) or
-                                        (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == sub.key and s.value == sub.value for s in o.batch_items))
+                                        (o.op_type == OpType.BATCH and o.batch_puts.get(sub.key) == sub.value)
                                     ) and (
                                         (o.seq < op.seq and o.op_id in unacked_committed) or
                                         (o.seq > op.seq or were_concurrent(o, op))
@@ -665,7 +680,7 @@ class DatabaseOracle:
                                 valid_del = any(
                                     o.op_id != op.op_id and not o.errored and (
                                         (o.op_type == OpType.DEL and o.key == sub.key) or
-                                        (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == sub.key for s in o.batch_items))
+                                        (o.op_type == OpType.BATCH and sub.key in o.batch_dels)
                                     ) and (
                                         (o.seq < op.seq and o.op_id in unacked_committed) or
                                         (o.seq > op.seq or were_concurrent(o, op))

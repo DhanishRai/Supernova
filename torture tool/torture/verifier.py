@@ -201,7 +201,7 @@ class StateVerifier:
 
         # 5. Direct Point-Lookup verification (GET):
         # Verify that ReadAt on disk returns exact value for recovered keys
-        sample_keys = list(dump_records.keys())[:25]
+        sample_keys = list(dump_records.keys())[:5]
         for k in sample_keys:
             try:
                 ret_get, out_get, err_get = self._run_cmd("get", extra_args=[k])

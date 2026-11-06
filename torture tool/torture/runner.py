@@ -132,7 +132,7 @@ class CrashTestRunner:
             oracle_items = []
             for i in range(ops_per_batch):
                 seq_id = b_idx * ops_per_batch + i
-                k = f"k_{seq_id:07d}" if not is_fake_engine else f"key_{(seq_id % 200):04d}"
+                k = f"k_{(seq_id % 2000):04d}" if not is_fake_engine else f"key_{(seq_id % 200):04d}"
                 coin = self.master_rng.random()
                 if coin < 0.80 or is_fake_engine:
                     v = f"val_{seq_id:07d}_" + ("x" * 24)
