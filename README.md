@@ -18,18 +18,19 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 3 complete
+- **Status:** Step 4 complete
 - **Engine Core:**
   - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
   - IEEE CRC32 checksum generation implemented covering payload length and payload bytes.
   - Binary record decoder (`decodeRecord`) implemented with defensive bounds checking before reading/allocating.
-  - In-memory hash index (`Index` backed by `map[string]entry`) implemented:
-    - Stores absolute `valueOffset int64` and `valueLen uint32` on disk without loading values into RAM.
-    - Accurately distinguishes between missing keys (`ok=false`) and empty values (`valueLen=0, ok=true`).
-    - Guarantees strict in-order operation and batch application (`Apply`, `ApplyBatch`).
-    - Benchmarked to scale gracefully beyond 1,000,000 entries (~476 ms insertion/lookup).
-  - Unit test suite expanded to 32 tests covering index operations, batch sequencing, and binary record serialization.
+  - In-memory hash index (`Index` backed by `map[string]entry`) implemented with ordered batch application.
+  - Database file structure and safe initialization (`Open`, `Close`, `DB` struct) implemented:
+    - Exactly 16-byte header with magic `"KVDB0001"`, little-endian version (1), and reserved uint32 (0).
+    - Crash-safe initialization: handles 0-byte or interrupted partial header files (< 16 bytes) by safely writing the complete header at offset 0 and syncing to disk.
+    - Preserves existing file content and rejects pre-existing record files until recovery is implemented in Step 5.
+    - Idempotent `Close()` with `sync.RWMutex` synchronization.
+  - Comprehensive unit test suite expanded to 33 tests across record encoding/decoding, indexing, and database file lifecycle.
 
 ---
 
@@ -84,7 +85,7 @@ Each operation entry:
 - [x] **Step 1:** Binary constants, record header structures, serialization (`encodeRecord`) & CRC32 calculation.
 - [x] **Step 2:** Binary record deserialization (`decodeRecord`), CRC validation, bounds checking & round-trip verification.
 - [x] **Step 3:** In-memory hash index (`Index`, `entry`, ordered batch application).
-- [ ] **Step 4:** File header structure (16 bytes), file initialization, header validation, and open/close lifecycle.
+- [x] **Step 4:** File header structure (16 bytes), file initialization, header validation, and open/close lifecycle.
 - [ ] **Step 5:** Record append, fsync durability, and rollback on failed write.
 - [ ] **Step 6:** Startup recovery scan & index rebuilding.
 - [ ] **Step 7:** Read path (`Get`) using disk offset indexing (`ReadAt`).
