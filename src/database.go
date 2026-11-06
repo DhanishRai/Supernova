@@ -32,20 +32,36 @@ var (
 	ErrInvalidHeaderReserved = errors.New("reserved header field must be zero")
 	// ErrDatabaseClosed indicates an operation was attempted on a closed database.
 	ErrDatabaseClosed = errors.New("database is closed")
+	// ErrDatabaseUnusable indicates the database encountered an unrecoverable write or rollback failure.
+	ErrDatabaseUnusable = errors.New("database is unusable due to unconfirmed rollback")
+	// ErrDiskFull indicates appending the record would exceed the maximum configured database size.
+	ErrDiskFull = errors.New("database file size limit reached")
 	// ErrRecordsNotSupported indicates the file contains data beyond the 16-byte header
 	// before recovery scanning has been implemented.
 	ErrRecordsNotSupported = errors.New("database contains records beyond header; recovery not yet implemented")
 )
 
+// storageFile defines the file operations required by the storage engine.
+// This interface allows fault-injection testing without external libraries.
+type storageFile interface {
+	ReadAt(p []byte, off int64) (n int, err error)
+	WriteAt(p []byte, off int64) (n int, err error)
+	Truncate(size int64) error
+	Sync() error
+	Close() error
+	Stat() (os.FileInfo, error)
+}
+
 // DB represents an open instance of the key-value database engine.
 type DB struct {
 	mu       sync.RWMutex
-	file     *os.File
+	file     storageFile
 	path     string
 	size     int64
 	maxBytes int64
 	index    *Index
 	closed   bool
+	unusable bool
 }
 
 // Open opens an existing database or creates a new one at the specified path.
