@@ -197,7 +197,19 @@ func encodeRecord(ops []Operation) ([]byte, error) {
 //
 // The function does not trust any lengths in data and strictly validates bounds
 // before allocating or slicing memory.
-func decodeRecord(data []byte) ([]Operation, error) {
+// DecodedOp represents a decoded operation along with its relative value offset
+// from the start of the encoded record frame.
+type DecodedOp struct {
+	Type              OperationType
+	Key               []byte
+	Value             []byte
+	RelativeValOffset int64
+	ValueLen          uint32
+}
+
+// decodeRecordWithOffsets decodes and validates a complete binary record, providing
+// each operation's value offset relative to the beginning of the record.
+func decodeRecordWithOffsets(data []byte) ([]DecodedOp, error) {
 	if len(data) < RecordHeaderSize {
 		return nil, ErrRecordTooShort
 	}
@@ -235,7 +247,7 @@ func decodeRecord(data []byte) ([]Operation, error) {
 	}
 
 	payloadEnd := len(data)
-	ops := make([]Operation, 0, opCount)
+	ops := make([]DecodedOp, 0, opCount)
 
 	for i := uint32(0); i < opCount; i++ {
 		// Must have at least OpHeaderSize (7 bytes)
@@ -277,6 +289,8 @@ func decodeRecord(data []byte) ([]Operation, error) {
 		copy(key, data[payloadOffset:payloadOffset+int(keyLen)])
 		payloadOffset += int(keyLen)
 
+		relValOffset := int64(payloadOffset)
+
 		var val []byte
 		if valLen > 0 {
 			val = make([]byte, valLen)
@@ -284,15 +298,36 @@ func decodeRecord(data []byte) ([]Operation, error) {
 			payloadOffset += int(valLen)
 		}
 
-		ops = append(ops, Operation{
-			Type:  opType,
-			Key:   key,
-			Value: val,
+		ops = append(ops, DecodedOp{
+			Type:              opType,
+			Key:               key,
+			Value:             val,
+			RelativeValOffset: relValOffset,
+			ValueLen:          valLen,
 		})
 	}
 
 	if payloadOffset != payloadEnd {
 		return nil, ErrTrailingData
+	}
+
+	return ops, nil
+}
+
+// decodeRecord decodes and validates a complete binary record.
+func decodeRecord(data []byte) ([]Operation, error) {
+	decodedOps, err := decodeRecordWithOffsets(data)
+	if err != nil {
+		return nil, err
+	}
+
+	ops := make([]Operation, len(decodedOps))
+	for i := range decodedOps {
+		ops[i] = Operation{
+			Type:  decodedOps[i].Type,
+			Key:   decodedOps[i].Key,
+			Value: decodedOps[i].Value,
+		}
 	}
 
 	return ops, nil

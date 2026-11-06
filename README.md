@@ -18,12 +18,12 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 7 complete
+- **Status:** Step 8 complete
 - **Engine Core:**
   - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
   - IEEE CRC32 checksum generation implemented covering payload length and payload bytes.
-  - Binary record decoder (`decodeRecord`) implemented with defensive bounds checking before reading/allocating.
+  - Binary record decoder (`decodeRecord`) and offset-aware variant (`decodeRecordWithOffsets`) implemented with defensive bounds checking before reading/allocating; each decoded operation carries its value's offset relative to the start of its encoded record.
   - In-memory hash index (`Index` backed by `map[string]entry`) implemented with ordered batch application.
   - Database file structure and safe initialization (`Open`, `Close`, `DB` struct) implemented with 16-byte header.
   - Internal durable record append (`appendRecord`) with rollback and poison state handling.
@@ -33,7 +33,16 @@ Key guarantees:
     - Validates all operations upfront before acquiring write lock or executing disk I/O; rejects invalid batches with zero disk writes.
     - Appends and issues `Sync()` before applying batch operations to the in-memory index.
     - Guarantees strict atomicity under `db.mu.Lock`: readers cannot observe partial, intermediate, or uncommitted batch states.
-  - Comprehensive unit test suite expanded to 63 tests covering record serialization, indexing, file lifecycle, fault injection, atomic batches, and concurrency.
+  - **Crash-safe startup recovery (`recoverDatabase`)** implemented:
+    - Removes any `<path>.tmp` file on startup (reserved for teammate's compaction).
+    - If file is shorter than 16 bytes, truncates to zero, writes a fresh header and syncs.
+    - Validates header magic (`KVDB0001`), version, and reserved field.
+    - Sequentially scans records from byte 16; for each record verifies the 8-byte outer header fits, reads `payloadLen`, confirms payload fits within remaining file, reads full payload, validates CRC32, decodes all operations with relative value offsets.
+    - Computes `absoluteValueOffset = recordStartOffset + relativeValueOffset` for each PUT and applies operations to the index in order.
+    - Stops at the first incomplete header, out-of-bounds payload, CRC mismatch, or invalid operation data.
+    - If `scanOffset < fileSize` after scanning (torn tail detected), truncates the file to `scanOffset` and syncs, ensuring recovery is idempotent if killed mid-truncation.
+    - `Open()` delegates entirely to `recoverDatabase()` for a consistent startup path whether the file is new or existing.
+  - Comprehensive unit test suite: **75 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, and all recovery edge cases.
 
 ---
 
@@ -92,7 +101,7 @@ Each operation entry:
 - [x] **Step 5:** Record append, fsync durability, and rollback on failed write.
 - [x] **Step 6:** Core operations (`Put`, `Get`, `Delete`) with global synchronization and safe value extraction.
 - [x] **Step 7:** Atomic multi-operation batch write (`Batch`).
-- [ ] **Step 8:** Startup recovery scan & index rebuilding.
+- [x] **Step 8:** Startup recovery scan & index rebuilding.
 - [ ] **Step 9:** Crash safety verification, boundary torture testing, and recovery guarantees.
 
 ---

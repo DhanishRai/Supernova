@@ -1,7 +1,6 @@
 package killitdb
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -67,89 +66,40 @@ type DB struct {
 }
 
 // Open opens an existing database or creates a new one at the specified path.
-// If the file is shorter than 16 bytes (or empty/interrupted during previous creation),
-// it initializes the 16-byte header at offset 0 and syncs to disk.
+// It removes any dangling compaction temporary file (.tmp) and performs
+// crash-safe recovery, scanning all durable records and rebuilding the in-memory index.
 func Open(path string, maxBytes int64) (*DB, error) {
 	if maxBytes < HeaderSize {
 		return nil, ErrInvalidMaxBytes
 	}
 
+	// 1. Remove compaction temporary file (path + ".tmp") if present.
+	tmpPath := path + ".tmp"
+	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to clean up compaction temporary file: %w", err)
+	}
+
+	// 2. Open or create the authoritative data file.
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
 
-	stat, err := file.Stat()
+	// 3. Perform crash-safe recovery (header check, record scan, index rebuild, torn tail truncation).
+	index, recoveredSize, err := recoverDatabase(file, maxBytes)
 	if err != nil {
 		file.Close()
-		return nil, fmt.Errorf("failed to stat database file: %w", err)
-	}
-
-	fileSize := stat.Size()
-	if fileSize > maxBytes {
-		file.Close()
-		return nil, ErrFileExceedsMaxBytes
-	}
-
-	// If the file is shorter than 16 bytes (e.g. 0 bytes or interrupted write),
-	// safely write the 16-byte header at offset zero and sync.
-	if fileSize < HeaderSize {
-		var header [HeaderSize]byte
-		copy(header[0:8], HeaderMagic)
-		binary.LittleEndian.PutUint32(header[8:12], CurrentVersion)
-		binary.LittleEndian.PutUint32(header[12:16], 0) // Reserved uint32
-
-		if _, err := file.WriteAt(header[:], 0); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("failed to write database header: %w", err)
-		}
-
-		if err := file.Sync(); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("failed to sync database header: %w", err)
-		}
-
-		fileSize = HeaderSize
-	}
-
-	// Read and validate the 16-byte header
-	var headerBuf [HeaderSize]byte
-	if _, err := file.ReadAt(headerBuf[:], 0); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to read database header: %w", err)
-	}
-
-	if string(headerBuf[0:8]) != HeaderMagic {
-		file.Close()
-		return nil, ErrInvalidMagic
-	}
-
-	version := binary.LittleEndian.Uint32(headerBuf[8:12])
-	if version != CurrentVersion {
-		file.Close()
-		return nil, ErrUnsupportedVersion
-	}
-
-	reserved := binary.LittleEndian.Uint32(headerBuf[12:16])
-	if reserved != 0 {
-		file.Close()
-		return nil, ErrInvalidHeaderReserved
-	}
-
-	// In this step, reject files that contain records beyond the header
-	// until recovery scanning is implemented in subsequent steps.
-	if fileSize > HeaderSize {
-		file.Close()
-		return nil, ErrRecordsNotSupported
+		return nil, err
 	}
 
 	db := &DB{
 		file:     file,
 		path:     path,
-		size:     fileSize,
+		size:     recoveredSize,
 		maxBytes: maxBytes,
-		index:    newIndex(),
+		index:    index,
 		closed:   false,
+		unusable: false,
 	}
 
 	return db, nil

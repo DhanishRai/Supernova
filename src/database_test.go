@@ -231,35 +231,32 @@ func TestDB_OpenExistingFile_PreservesContent(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "existing_records.db")
 
-	// Write 16-byte valid header plus some mock record bytes
-	var header [HeaderSize]byte
-	copy(header[0:8], HeaderMagic)
-	binary.LittleEndian.PutUint32(header[8:12], CurrentVersion)
-	binary.LittleEndian.PutUint32(header[12:16], 0)
-
-	payload := []byte("mock-pre-existing-record-content")
-	fullFile := append(header[:], payload...)
-
-	if err := os.WriteFile(dbPath, fullFile, 0666); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	// Open should reject because records beyond header are not yet supported in Step 4,
-	// and CRUCIALLY must NOT truncate or overwrite the file!
-	_, err := Open(dbPath, 1024*1024)
-	if !errors.Is(err, ErrRecordsNotSupported) {
-		t.Fatalf("expected ErrRecordsNotSupported, got %v", err)
-	}
-
-	// Verify the original contents and file size remain completely untouched
-	dataAfter, err := os.ReadFile(dbPath)
+	// Open, write valid record, and close
+	db1, err := Open(dbPath, 1024*1024)
 	if err != nil {
-		t.Fatalf("ReadFile failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
-	if len(dataAfter) != len(fullFile) {
-		t.Fatalf("file was modified! expected length %d, got %d", len(fullFile), len(dataAfter))
+	if err := db1.Put([]byte("persisted-key"), []byte("persisted-val")); err != nil {
+		t.Fatalf("Put failed: %v", err)
 	}
-	if string(dataAfter[HeaderSize:]) != string(payload) {
-		t.Fatalf("file content was corrupted or overwritten!")
+	sizeBefore := db1.Size()
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen existing database: valid records must be recovered and preserved
+	db2, err := Open(dbPath, 1024*1024)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	if db2.Size() != sizeBefore {
+		t.Fatalf("expected size %d to be preserved, got %d", sizeBefore, db2.Size())
+	}
+
+	val, err := db2.Get([]byte("persisted-key"))
+	if err != nil || string(val) != "persisted-val" {
+		t.Fatalf("expected 'persisted-val', got '%s' (err=%v)", string(val), err)
 	}
 }
