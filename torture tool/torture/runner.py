@@ -854,21 +854,58 @@ class CrashTestRunner:
                     sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
                     return 1
 
-                # 3. Successful writes before reaching limit (small PUT, DEL, BATCH)
-                num_pre_ops = 15
+                # 3. Organic Cap Approach (Random sizes until approaching or hitting cap)
+                hit_organic_cap = False
                 key_pool = [f"df_k_{i:03d}" for i in range(1, 8)]
                 last_acked_key = None
                 last_acked_val = None
+                total_submitted = 0
 
-                for op_idx in range(1, num_pre_ops + 1):
-                    op_id = f"df-seed-{op_idx}"
+                # Seed dead data first to ensure compaction will definitely reclaim space
+                dead_k = f"dead_k_{iter_num}"
+                dead_v = "DEAD_DATA_PADDING_" * 20
+                dead_put_id = f"df-dead-put-{iter_num}"
+                oracle.record_put(dead_put_id, dead_k, dead_v, writer_id="df-init")
+                total_submitted += 1
+                try:
+                    resp_dead_put = client.put(dead_k, dead_v, op_id=dead_put_id, timeout=5.0)
+                    if resp_dead_put.is_ack:
+                        oracle.record_ack(dead_put_id)
+                        successful_writes += 1
+                        last_acked_key = dead_k
+                        last_acked_val = dead_v
+
+                        # Now delete it to create reclaimable tombstone
+                        dead_del_id = f"df-dead-del-{iter_num}"
+                        oracle.record_del(dead_del_id, dead_k, writer_id="df-init")
+                        total_submitted += 1
+                        resp_dead_del = client.delete(dead_k, op_id=dead_del_id, timeout=5.0)
+                        if resp_dead_del.is_ack:
+                            oracle.record_ack(dead_del_id)
+                            successful_writes += 1
+                        else:
+                            oracle.record_err(dead_del_id, resp_dead_del.message or "disk full")
+                            hit_organic_cap = True
+                    else:
+                        oracle.record_err(dead_put_id, resp_dead_put.message or "disk full")
+                        hit_organic_cap = True
+                except Exception as exc:
+                    violations.append(f"Initialization write failed: {exc}")
+
+                max_organic_ops = iter_rng.randint(12, 35)
+                for op_idx in range(1, max_organic_ops + 1):
+                    if hit_organic_cap:
+                        break
+                    op_id = f"df-organic-{op_idx}"
                     coin = iter_rng.random()
                     k = iter_rng.choice(key_pool)
+                    total_submitted += 1
 
-                    if coin < 0.5:
-                        # PUT
-                        v = f"seed_val_{op_idx}_{iter_rng.randint(1000, 9999)}"
-                        oracle.record_put(op_id, k, v, writer_id="df-seeder")
+                    if coin < 0.55:
+                        # PUT with random size
+                        val_len = iter_rng.randint(32, min(2048, max(64, max_bytes // 10)))
+                        v = f"v_{op_idx}_" + (iter_rng.choice(["A", "B", "C", "D"]) * val_len)
+                        oracle.record_put(op_id, k, v, writer_id="df-organic")
                         resp = client.put(k, v, op_id=op_id)
                         if resp.is_ack:
                             oracle.record_ack(op_id)
@@ -876,22 +913,27 @@ class CrashTestRunner:
                             last_acked_key = k
                             last_acked_val = v
                         else:
-                            oracle.record_err(op_id, resp.message or "error")
-                            violations.append(f"Unexpected pre-limit PUT error for op '{op_id}': {resp.message}")
-                    elif coin < 0.75:
+                            oracle.record_err(op_id, resp.message or "disk full")
+                            failed_puts += 1
+                            clean_err_count += 1
+                            hit_organic_cap = True
+                            break
+                    elif coin < 0.80:
                         # DEL
-                        oracle.record_del(op_id, k, writer_id="df-seeder")
+                        oracle.record_del(op_id, k, writer_id="df-organic")
                         resp = client.delete(k, op_id=op_id)
                         if resp.is_ack:
                             oracle.record_ack(op_id)
                             successful_writes += 1
                         else:
-                            oracle.record_err(op_id, resp.message or "error")
-                            violations.append(f"Unexpected pre-limit DEL error for op '{op_id}': {resp.message}")
+                            oracle.record_err(op_id, resp.message or "disk full")
+                            clean_err_count += 1
+                            hit_organic_cap = True
+                            break
                     else:
                         # BATCH
                         k1 = iter_rng.choice(key_pool)
-                        v1 = f"batch_val_{op_idx}_{iter_rng.randint(1000, 9999)}"
+                        v1 = f"b_val_{op_idx}_" + ("E" * iter_rng.randint(32, 256))
                         k2 = iter_rng.choice(key_pool)
                         batch_items = [
                             BatchItem.make_put(k1, v1),
@@ -903,7 +945,7 @@ class CrashTestRunner:
                                 BatchSubOp(op_type=OpType.PUT, key=k1, value=v1),
                                 BatchSubOp(op_type=OpType.DEL, key=k2),
                             ],
-                            writer_id="df-seeder",
+                            writer_id="df-organic",
                         )
                         resp = client.batch(batch_items, op_id=op_id)
                         if resp.is_ack:
@@ -912,19 +954,21 @@ class CrashTestRunner:
                             last_acked_key = k1
                             last_acked_val = v1
                         else:
-                            oracle.record_err(op_id, resp.message or "error")
-                            violations.append(f"Unexpected pre-limit BATCH error for op '{op_id}': {resp.message}")
+                            oracle.record_err(op_id, resp.message or "disk full")
+                            failed_batches += 1
+                            clean_err_count += 1
+                            hit_organic_cap = True
+                            break
 
-                # 4. PUT exceeding the limit
-                over_put_id = f"df-put-overlimit-{iter_num}"
+                # 4. Explicit Over-Limit PUT (if organic cap wasn't hit yet)
                 over_put_k = f"over_put_key_{iter_num}"
-                # Generate large payload exceeding max_bytes
-                over_put_v = "X" * (max_bytes + 2048)
+                over_put_id = f"df-put-overlimit-{iter_num}"
+                over_put_v = "X" * min(1024 * 1024, max(4096, max_bytes + 2048))
                 oracle.record_put(over_put_id, over_put_k, over_put_v, writer_id="df-tester")
+                total_submitted += 1
                 try:
                     resp_put = client.put(over_put_k, over_put_v, op_id=over_put_id, timeout=10.0)
                     if not resp_put.is_ack:
-                        # Clean ERR response
                         oracle.record_err(over_put_id, resp_put.message or "disk full")
                         failed_puts += 1
                         clean_err_count += 1
@@ -937,43 +981,85 @@ class CrashTestRunner:
                 except Exception as exc:
                     violations.append(f"Failed while sending over-limit PUT '{over_put_id}': {exc}")
 
-                # 5. BATCH exceeding the limit (must NOT be partially applied)
-                over_batch_id = f"df-batch-overlimit-{iter_num}"
-                b_k1 = f"over_batch_k1_{iter_num}"
-                b_v1 = f"batch_pre_item_{iter_num}"
-                b_k2 = f"over_batch_k2_{iter_num}"
-                b_v2 = "Y" * (max_bytes + 2048)
-                b_k3 = f"over_batch_k3_{iter_num}"
+                # 5. E2: Batch Crossing Cap Midway (must be atomically rejected)
+                over_batch_id = f"df-e2-batch-{iter_num}"
+                b_k1 = f"e2_early_k_{iter_num}"
+                b_v1 = f"e2_early_val_{iter_num}"
+                b_k2 = f"e2_oversized_k_{iter_num}"
+                b_v2 = "Z" * min(1024 * 1024, max(4096, max_bytes + 2048))
+                b_k3 = f"e2_late_k_{iter_num}"
+                b_v3 = f"e2_late_val_{iter_num}"
 
                 batch_items = [
                     BatchItem.make_put(b_k1, b_v1),
                     BatchItem.make_put(b_k2, b_v2),
-                    BatchItem.make_del(b_k3),
+                    BatchItem.make_put(b_k3, b_v3),
                 ]
                 oracle.record_batch(
                     over_batch_id,
                     [
                         BatchSubOp(op_type=OpType.PUT, key=b_k1, value=b_v1),
                         BatchSubOp(op_type=OpType.PUT, key=b_k2, value=b_v2),
-                        BatchSubOp(op_type=OpType.DEL, key=b_k3),
+                        BatchSubOp(op_type=OpType.PUT, key=b_k3, value=b_v3),
                     ],
                     writer_id="df-tester",
                 )
+                total_submitted += 1
                 try:
                     resp_batch = client.batch(batch_items, op_id=over_batch_id, timeout=10.0)
                     if not resp_batch.is_ack:
-                        # Clean ERR response
                         oracle.record_err(over_batch_id, resp_batch.message or "disk full")
                         failed_batches += 1
                         clean_err_count += 1
                     else:
                         oracle.record_ack(over_batch_id)
                         violations.append(
-                            f"DISK-FULL VIOLATION: Engine ACKed oversized BATCH '{over_batch_id}' "
+                            f"DISK-FULL VIOLATION: Engine ACKed midway-crossing batch '{over_batch_id}' "
                             f"exceeding max-bytes limit of {max_bytes}!"
                         )
                 except Exception as exc:
-                    violations.append(f"Failed while sending over-limit BATCH '{over_batch_id}': {exc}")
+                    violations.append(f"Failed while sending midway-crossing batch '{over_batch_id}': {exc}")
+
+                # 6. E4: Compaction at the Cap
+                compact_op_id = f"df-compact-cap-{iter_num}"
+                total_submitted += 1
+                try:
+                    resp_compact = client.compact(op_id=compact_op_id, timeout=10.0)
+                    if not resp_compact.is_ack:
+                        violations.append(f"E4 VIOLATION: Compaction at cap failed: {resp_compact.message}")
+                except Exception as exc:
+                    violations.append(f"E4 VIOLATION: Compaction at cap failed with exception: {exc}")
+
+                # 7. E5: Writes Succeeding After Delete + Compaction
+                e5_put_id = f"df-e5-resume-put-{iter_num}"
+                e5_k = f"e5_resume_k_{iter_num}"
+                e5_v = f"e5_resume_val_{iter_num}"
+                oracle.record_put(e5_put_id, e5_k, e5_v, writer_id="df-e5")
+                total_submitted += 1
+                try:
+                    resp_e5 = client.put(e5_k, e5_v, op_id=e5_put_id, timeout=5.0)
+                    if resp_e5.is_ack:
+                        oracle.record_ack(e5_put_id)
+                        successful_writes += 1
+                        last_acked_key = e5_k
+                        last_acked_val = e5_v
+                    else:
+                        oracle.record_err(e5_put_id, resp_e5.message or "error")
+                        violations.append(
+                            f"E5 VIOLATION: Write '{e5_put_id}' failed after compaction freed space: {resp_e5.message}"
+                        )
+                except Exception as exc:
+                    violations.append(f"E5 VIOLATION: Failed write after compaction: {exc}")
+
+                # 8. Max-Bytes Invariant Check (before kill)
+                target_data_file = db_path if os.path.exists(db_path) else db_path + ".data"
+                if os.path.exists(target_data_file):
+                    sz_before_kill = os.path.getsize(target_data_file)
+                    if sz_before_kill > max_bytes:
+                        violations.append(
+                            f"DISK-FULL VIOLATION: Database file size ({sz_before_kill} bytes) "
+                            f"exceeds max-bytes limit ({max_bytes} bytes) before kill!"
+                        )
 
                 # 6. Existing data remains readable before kill
                 if not client.is_alive:
@@ -1028,11 +1114,20 @@ class CrashTestRunner:
                 passed, verify_violations, actual_dump = verifier.verify(oracle)
                 violations.extend(verify_violations)
 
-                # Ensure failed batch items are NOT partially present
-                if b_k1 in actual_dump or b_k2 in actual_dump:
+                # Check max-bytes on disk after recovery
+                if os.path.exists(target_data_file):
+                    sz_after_rec = os.path.getsize(target_data_file)
+                    if sz_after_rec > max_bytes:
+                        violations.append(
+                            f"DISK-FULL VIOLATION: Recovered database file size ({sz_after_rec} bytes) "
+                            f"exceeds max-bytes limit ({max_bytes} bytes) after recovery!"
+                        )
+
+                # Ensure E2 midway-crossing batch items are NOT partially present
+                if b_k1 in actual_dump or b_k2 in actual_dump or b_k3 in actual_dump:
                     violations.append(
                         f"ATOMICITY VIOLATION: Failed batch '{over_batch_id}' was partially applied! "
-                        f"Items visible in dump: {[k for k in (b_k1, b_k2) if k in actual_dump]}"
+                        f"Items visible in dump: {[k for k in (b_k1, b_k2, b_k3) if k in actual_dump]}"
                     )
 
                 # Ensure failed PUT item is NOT present
@@ -1040,6 +1135,12 @@ class CrashTestRunner:
                     violations.append(
                         f"INTEGRITY VIOLATION: Rejected PUT '{over_put_id}' key '{over_put_k}' "
                         f"was persisted in recovered database!"
+                    )
+
+                # Ensure E5 write after compaction is successfully recovered
+                if e5_k not in actual_dump or actual_dump[e5_k] != e5_v:
+                    violations.append(
+                        f"DURABILITY VIOLATION: E5 resumed write key '{e5_k}' is missing or corrupted after recovery!"
                     )
 
                 t_duration = time.time() - t_start
@@ -1061,7 +1162,7 @@ class CrashTestRunner:
                     total_iterations=self.config.iterations,
                     passed=(len(violations) == 0),
                     delay_ms=int(delay_ms),
-                    submitted=num_pre_ops + 2,
+                    submitted=total_submitted,
                     acked=successful_writes,
                     recovered_keys=len(actual_dump),
                     duration_s=t_duration,

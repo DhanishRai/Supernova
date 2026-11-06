@@ -32,6 +32,7 @@ from torture.oracle import DatabaseOracle, OpType
 from torture.protocol import (
     EngineClient,
     UnexpectedEOFError,
+    EngineProcessError,
 )
 from torture.runner import CrashTestRunner
 from torture.verifier import StateVerifier
@@ -250,7 +251,8 @@ class TestLargeValues(unittest.TestCase):
         caught_expected_error = False
         try:
             client.put(key, val, op_id="op-pipe-kill", timeout=1.0)
-        except (BrokenPipeError, UnexpectedEOFError, OSError):
+        except (BrokenPipeError, UnexpectedEOFError,
+    EngineProcessError, OSError, EngineProcessError):
             caught_expected_error = True
         except Exception:
             caught_expected_error = True
@@ -291,7 +293,8 @@ class TestLargeValues(unittest.TestCase):
 
         try:
             client.put(key, val, op_id="op-proc-kill", timeout=0.5)
-        except (BrokenPipeError, UnexpectedEOFError, OSError):
+        except (BrokenPipeError, UnexpectedEOFError,
+    EngineProcessError, OSError, EngineProcessError):
             pass
 
         kill_thread.join(timeout=1.0)

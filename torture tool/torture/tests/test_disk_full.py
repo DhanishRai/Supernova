@@ -208,6 +208,58 @@ class TestDiskFullMode(unittest.TestCase):
         )
 
 
+    def test_sabotage_detection_max_bytes_exceeded(self) -> None:
+        """
+        Sabotage Test: An engine ignores the max-bytes limit, allowing the database file
+        to grow past the configured cap. The torture tool must detect this DISK-FULL VIOLATION
+        and immediately fail with exit code 1.
+        """
+        sabotaged_engine_path = os.path.join(self.temp_dir, "sabotaged_engine_ignore_cap.py")
+        with open(self.engine_bin, "r", encoding="utf-8") as src_f:
+            content = src_f.read()
+
+        # Inject sabotage: force max_bytes to None in do_serve
+        target_str = "def do_serve(db_path: str, max_bytes: Optional[int] = None) -> int:"
+        buggy_code = "def do_serve(db_path: str, max_bytes: Optional[int] = None) -> int:\n    max_bytes = None  # SABOTAGE: Ignore disk-full limit"
+        self.assertIn(target_str, content)
+        sabotaged_content = content.replace(target_str, buggy_code, 1)
+
+        with open(sabotaged_engine_path, "w", encoding="utf-8") as dst_f:
+            dst_f.write(sabotaged_content)
+        os.chmod(sabotaged_engine_path, 0o755)
+
+        config = TortureConfig(
+            iterations=1,
+            seed=993344,
+            mode=TortureMode.DISK_FULL,
+            engine_bin=sabotaged_engine_path,
+            db_path=self.db_path,
+            max_bytes=4_000,
+            artifacts_dir=os.path.join(self.temp_dir, "artifacts_exceeded"),
+            min_kill_delay_ms=5,
+            max_kill_delay_ms=15,
+        )
+        runner = CrashTestRunner(config)
+        ret = runner.run()
+
+        # Must detect file size violation and exit with code 1
+        self.assertEqual(ret, 1, "Torture tool failed to detect max-bytes file size violation!")
+
+        artifacts_dir = config.artifacts_dir
+        self.assertTrue(os.path.exists(artifacts_dir))
+        fail_folders = os.listdir(artifacts_dir)
+        self.assertTrue(len(fail_folders) > 0)
+        report_json = os.path.join(artifacts_dir, fail_folders[0], "failure_report.json")
+        self.assertTrue(os.path.exists(report_json))
+
+        with open(report_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertTrue(
+            any("DISK-FULL VIOLATION" in err for err in data["errors"]),
+            f"Expected DISK-FULL VIOLATION in errors, got: {data['errors']}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

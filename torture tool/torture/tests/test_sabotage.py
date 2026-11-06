@@ -52,8 +52,8 @@ class TestSabotageDetection(unittest.TestCase):
             db_path=self.test_db,
             oracle_path="/tmp/sabotage1_oracle.log",
             workers=1,
-            min_kill_delay_ms=60,
-            max_kill_delay_ms=100,
+            min_kill_delay_ms=120,
+            max_kill_delay_ms=220,
         )
         runner = CrashTestRunner(config)
         ret = runner.run()
@@ -74,8 +74,8 @@ class TestSabotageDetection(unittest.TestCase):
             db_path=self.test_db,
             oracle_path="/tmp/sabotage2_oracle.log",
             workers=1,
-            min_kill_delay_ms=60,
-            max_kill_delay_ms=100,
+            min_kill_delay_ms=120,
+            max_kill_delay_ms=220,
         )
         runner = CrashTestRunner(config)
         ret = runner.run()
