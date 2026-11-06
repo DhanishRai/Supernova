@@ -78,7 +78,8 @@ class ChildProcessExitInfo:
         is_alive = getattr(client, "is_alive", False)
 
         effective_code = kill_ret if kill_ret is not None else returncode
-        killed_by_sigkill = (effective_code in (-signal.SIGKILL, 137, 9))
+        valid_kill_codes = (-signal.SIGKILL, 137, 9, 15) if sys.platform == "win32" else (-signal.SIGKILL, 137)
+        killed_by_sigkill = (effective_code in valid_kill_codes)
 
         cause = "Still running" if is_alive else f"Exit code {effective_code}"
         if killed_by_sigkill:
@@ -188,7 +189,16 @@ def classify_failure(
         if "malformed" in err.lower() or "unknown op_id" in err.lower() or "protocol" in err.lower():
             return FailureCategory.PROTOCOL_FAILURE
 
-    # 3. Recovery failure detection (open, check, dump)
+    # 3. Engine failure (unexpected exit code, panic, or dying without SIGKILL)
+    if child_exit and not child_exit.killed_by_sigkill:
+        return FailureCategory.ENGINE_FAILURE
+
+    for err in errors:
+        err_l = err.lower()
+        if "engine crash" in err_l or "engine failure" in err_l or "engine process" in err_l or "engine died" in err_l or "did not exit with sigkill" in err_l:
+            return FailureCategory.ENGINE_FAILURE
+
+    # 4. Recovery failure detection (open, check, dump)
     for err in errors:
         err_lower = err.lower()
         if (
@@ -202,24 +212,16 @@ def classify_failure(
         ):
             return FailureCategory.RECOVERY_FAILURE
 
-    # 4. Oracle failure detection (durability, atomicity, integrity)
+    # 5. Oracle failure detection (durability, atomicity, integrity, errored ops)
     for err in errors:
         if any(v in err for v in [
             "DURABILITY VIOLATION",
             "ATOMICITY VIOLATION",
             "INTEGRITY VIOLATION",
             "DELETION VIOLATION",
+            "ERRORED OP VIOLATION",
         ]):
             return FailureCategory.ORACLE_FAILURE
-
-    # 5. Engine failure (unexpected exit code or dying without SIGKILL)
-    if child_exit and not child_exit.killed_by_sigkill:
-        if child_exit.returncode is not None and child_exit.returncode != 0:
-            return FailureCategory.ENGINE_FAILURE
-
-    for err in errors:
-        if "engine process" in err.lower() or "engine died" in err.lower() or "did not exit with sigkill" in err.lower():
-            return FailureCategory.ENGINE_FAILURE
 
     return FailureCategory.ORACLE_FAILURE if errors else FailureCategory.ENGINE_FAILURE
 
@@ -586,7 +588,7 @@ class Reporter:
 
             f.write("--- AVAILABLE STDERR OUTPUT ---\n")
             if details.stderr_lines:
-                for line in details.stderr_lines[-30:]:
+                for line in list(details.stderr_lines)[-30:]:
                     f.write(f"  {line.rstrip()}\n")
             else:
                 f.write("  (No stderr output captured)\n")

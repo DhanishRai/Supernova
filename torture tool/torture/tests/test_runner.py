@@ -104,6 +104,62 @@ class TestCrashRunnerWithFakeEngine(unittest.TestCase):
         ret = runner.run()
         self.assertEqual(ret, 0, "Multi-iteration torture run failed")
 
+    def test_engine_panic_crash_detected_as_engine_failure(self) -> None:
+        """
+        [SABOTAGE TEST - Item 4]
+        Proves that if the engine crashes/panics with a non-zero exit code (e.g. Go panic exit code 2),
+        the torture tool does NOT mask it as SIGKILL.
+        It must fail the run, classify as ENGINE_FAILURE, and record exact exit code 2.
+        """
+        import json
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="torture_panic_test_")
+        artifacts_dir = os.path.join(temp_dir, "artifacts")
+        panic_engine = os.path.join(temp_dir, "panic_engine.py")
+
+        # Create an engine script that immediately panics and exits with code 2
+        with open(panic_engine, "w", encoding="utf-8") as f:
+            f.write(
+                "import sys\n"
+                "if len(sys.argv) > 1 and sys.argv[1] == 'serve':\n"
+                "    sys.stderr.write('panic: runtime error: invalid memory address\\n')\n"
+                "    sys.exit(2)\n"
+                "sys.exit(0)\n"
+            )
+
+        try:
+            config = TortureConfig(
+                iterations=1,
+                seed=999,
+                mode=TortureMode.DEFAULT,
+                engine_bin=panic_engine,
+                db_path=os.path.join(temp_dir, "panic.db"),
+                artifacts_dir=artifacts_dir,
+                workers=1,
+                min_kill_delay_ms=100,
+                max_kill_delay_ms=150,
+            )
+            runner = CrashTestRunner(config)
+            ret = runner.run()
+
+            # Must FAIL
+            self.assertEqual(ret, 1, "Spontaneous engine panic/crash must cause runner to return exit code 1!")
+
+            # Verify artifact classification
+            subdirs = [d for d in os.listdir(artifacts_dir) if os.path.isdir(os.path.join(artifacts_dir, d))]
+            self.assertGreaterEqual(len(subdirs), 1, "Artifacts must be preserved for engine crash")
+            report_file = os.path.join(artifacts_dir, subdirs[0], "failure_report.json")
+            self.assertTrue(os.path.exists(report_file))
+
+            with open(report_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.assertEqual(data["failure_category"], "Engine failure", "Crash must be categorized as Engine failure!")
+            self.assertFalse(data["child_process_exit_info"]["killed_by_sigkill"], "Engine panic must NOT be marked killed_by_sigkill!")
+            self.assertEqual(data["child_process_exit_info"]["returncode"], 2, "Exact exit code 2 must be recorded!")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

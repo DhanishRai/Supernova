@@ -501,7 +501,7 @@ class CrashTestRunner:
                     pid=open_proc.pid if open_proc else None,
                     returncode=last_exit_status,
                     is_alive=False,
-                    killed_by_sigkill=True,
+                    killed_by_sigkill=(last_exit_status in ((-signal.SIGKILL, 137, 9, 15) if sys.platform == "win32" else (-signal.SIGKILL, 137))),
                     termination_cause=f"Exit code {last_exit_status}",
                 )
                 details = FailureDetails(
@@ -669,12 +669,18 @@ class CrashTestRunner:
                 time.sleep(delay_ms / 1000.0)
 
                 # 6. Kill engine using SIGKILL at random instant
+                died_before_kill = (client._proc is not None and client._proc.poll() is not None)
+                premature_exit_code = client._proc.returncode if died_before_kill else None
+
                 kill_ret = client.kill(signal.SIGKILL)
                 compact_thread.join(timeout=1.0)
                 client.close()
                 compact_acked = compact_status["acked"]
 
                 child_exit = ChildProcessExitInfo.from_client(client, kill_ret)
+                if died_before_kill:
+                    child_exit.killed_by_sigkill = False
+                    child_exit.termination_cause = f"Engine crash before SIGKILL (exact exit code: {premature_exit_code})"
 
                 # 7. Check for temporary compaction files on disk before recovery
                 parent_dir = os.path.dirname(os.path.abspath(db_path))
@@ -1002,10 +1008,16 @@ class CrashTestRunner:
                 )
                 time.sleep(delay_ms / 1000.0)
 
+                died_before_kill = (client._proc is not None and client._proc.poll() is not None)
+                premature_exit_code = client._proc.returncode if died_before_kill else None
+
                 kill_ret = client.kill(signal.SIGKILL)
                 client.close()
 
                 child_exit = ChildProcessExitInfo.from_client(client, kill_ret)
+                if died_before_kill:
+                    child_exit.killed_by_sigkill = False
+                    child_exit.termination_cause = f"Engine crash before SIGKILL (exact exit code: {premature_exit_code})"
 
                 # 8. Restart, recover, check, dump, and Oracle verification
                 verifier = StateVerifier(
@@ -1174,7 +1186,7 @@ class CrashTestRunner:
                         db_path=db_path,
                         errors=[f"Failed to start engine in serve mode: {exc}"],
                         child_exit=child_exit,
-                        stderr_lines=client.stderr_lines if client else [],
+                        stderr_lines=list(client.stderr_lines) if client else [],
                     )
                     art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
                     sys.stderr.write(f"\n[FAIL] Iteration {iter_num}: Failed to start engine: {exc}\n")
@@ -1213,6 +1225,9 @@ class CrashTestRunner:
                 time.sleep(delay_ms / 1000.0)
 
                 # 5. Kill database process with SIGKILL at random instant
+                died_before_kill = (client._proc is not None and client._proc.poll() is not None)
+                premature_exit_code = client._proc.returncode if died_before_kill else None
+
                 kill_ret = client.kill(signal.SIGKILL)
 
                 # 6. Safely stop and join writer threads
@@ -1227,9 +1242,12 @@ class CrashTestRunner:
                 worker_exceptions = [err for w in workers for err in w.errors]
 
                 # Verify process actually terminated
-                is_dead = not client.is_alive
-                killed_by_sigkill = (kill_ret in (-signal.SIGKILL, 137)) or is_dead
+                valid_kill_codes = (-signal.SIGKILL, 137, 9, 15) if sys.platform == "win32" else (-signal.SIGKILL, 137)
+                killed_by_sigkill = (not died_before_kill) and (kill_ret in valid_kill_codes)
                 child_exit = ChildProcessExitInfo.from_client(client, kill_ret)
+                if died_before_kill:
+                    child_exit.killed_by_sigkill = False
+                    child_exit.termination_cause = f"Engine crash before SIGKILL (exact exit code: {premature_exit_code})"
 
                 # 7. Post-crash recovery, check, dump, and Oracle verification
                 verifier = StateVerifier(
@@ -1244,7 +1262,9 @@ class CrashTestRunner:
                 if not killed_by_sigkill:
                     passed = False
                     violations.append(
-                        f"Process {proc_pid} did not exit with SIGKILL (exit code: {kill_ret})"
+                        f"ENGINE CRASH: Process {proc_pid} crashed spontaneously before SIGKILL was delivered (exact exit code: {premature_exit_code})"
+                        if died_before_kill
+                        else f"ENGINE FAILURE: Process {proc_pid} did not exit with SIGKILL (exact exit code: {kill_ret})"
                     )
 
                 rep = IterationReport(
@@ -1279,7 +1299,7 @@ class CrashTestRunner:
                         db_path=db_path,
                         errors=violations,
                         child_exit=child_exit,
-                        stderr_lines=client.stderr_lines if client else [],
+                        stderr_lines=list(client.stderr_lines) if client else [],
                         actual_dump=actual_dump,
                         operation_ids=[op.op_id for op in oracle.history],
                         operation_types=sorted(list(set(op.op_type.value for op in oracle.history))),
@@ -1307,7 +1327,7 @@ class CrashTestRunner:
                     db_path=db_path,
                     errors=[f"Torture tool unexpected internal exception: {exc}\n{tb}"],
                     child_exit=child_exit,
-                    stderr_lines=client.stderr_lines if client else [],
+                    stderr_lines=list(client.stderr_lines) if client else [],
                 )
                 art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
                 sys.stderr.write(f"\n[CRASH] Iteration {iter_num}: Torture tool internal failure: {exc}\n")
