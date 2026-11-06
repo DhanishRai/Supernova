@@ -1200,7 +1200,7 @@ class CrashTestRunner:
                 shared_key_pool = (
                     [f"shared_key_{i}" for i in range(4)]
                     if self.config.mode == TortureMode.LARGE_VALUES
-                    else None
+                    else [f"key_{i:04d}" for i in range(self.config.key_pool_size)]
                 )
                 for w_idx in range(1, num_workers + 1):
                     w_seed = iter_rng.randint(1, 100_000_000)

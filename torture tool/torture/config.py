@@ -67,6 +67,7 @@ class TortureConfig:
     min_kill_delay_ms: int = 1
     max_kill_delay_ms: int = 50
     artifacts_dir: Optional[str] = None
+    key_pool_size: int = 500
 
     def validate(self) -> None:
         """
@@ -86,6 +87,8 @@ class TortureConfig:
                 f"max_kill_delay_ms ({self.max_kill_delay_ms}) cannot be less than "
                 f"min_kill_delay_ms ({self.min_kill_delay_ms})"
             )
+        if self.key_pool_size <= 0:
+            raise ValueError(f"key_pool_size must be positive, got {self.key_pool_size}")
         if self.max_bytes is not None and self.max_bytes <= 0:
             raise ValueError(f"max_bytes must be positive if set, got {self.max_bytes}")
 
@@ -166,6 +169,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory where diagnostic failure artifacts are preserved upon failure (default: torture tool/artifacts)",
     )
+    parser.add_argument(
+        "--key-pool-size",
+        type=int,
+        default=500,
+        help="Number of unique keys in the active key pool (default: 500)",
+    )
 
     return parser
 
@@ -206,6 +215,7 @@ def parse_args(args: Optional[List[str]] = None, print_generated_seed: bool = Tr
         min_kill_delay_ms=parsed.min_kill_delay_ms,
         max_kill_delay_ms=parsed.max_kill_delay_ms,
         artifacts_dir=parsed.artifacts_dir,
+        key_pool_size=getattr(parsed, 'key_pool_size', 500),
     )
     config.validate()
     return config
