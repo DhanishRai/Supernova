@@ -1182,6 +1182,97 @@ test disk full errors
 STOP after CP11.
 ```
 
+---
+
+## 14. Final Validation: Full Torture Suite Execution & Verification
+
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+We are beginning final validation.
+
+Do not introduce unnecessary architectural changes.
+
+FIRST:
+
+Inspect the complete torture tool.
+
+RUN REQUIRED COMMANDS:
+
+Default:
+
+./torture --iterations 500 --seed 12345
+
+Large values:
+
+./torture --iterations 100 --seed 999 --mode large-values
+
+Compaction:
+
+./torture --iterations 100 --seed 7 --mode compaction
+
+Recovery crash:
+
+./torture --iterations 100 --seed 42 --mode recovery-crash
+
+Also test:
+
+- large-batches.
+- disk-full.
+
+VERIFY:
+
+1. Python standard library only.
+2. Required command-line arguments.
+3. Controlled random generators.
+4. Independent oracle.
+5. Concurrent writers.
+6. Atomic batches.
+7. Real SIGKILL.
+8. Recovery verification.
+9. Recovery-crash testing.
+10. Compaction-crash testing.
+11. Disk-full behaviour.
+12. Failure reporting.
+13. Correct process cleanup.
+14. Executable permissions.
+15. Repository structure.
+16. PROMPTS.md accuracy.
+
+IMPORTANT:
+
+Do not claim a mode works unless it has actually been tested.
+
+Distinguish missed crash windows from successful crash tests.
+
+Do not hide failures.
+
+Fix discovered problems before committing.
+
+GIT COMMIT:
+
+finish torture test suite
+
+FINAL REPORT:
+
+Provide:
+
+- Completed stages.
+- Files created.
+- Commands executed.
+- Actual test results.
+- Known limitations.
+- Sabotage-test results.
+- Final Git commit hash.
+
+STOP after final validation.
+```
+
+
 
 
 
