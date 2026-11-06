@@ -1007,5 +1007,69 @@ improve failure reports
 STOP after CP8.
 ```
 
+---
+
+### Entry 11
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 16:25:18 IST
+- **Development Stage**: CP9 (Recovery-Crash Mode Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP9: recovery-crash mode.
+
+Add:
+
+--mode recovery-crash
+
+WORKFLOW:
+
+1. Create a database with acknowledged operations.
+2. Kill the serve process.
+3. Start kvdb open.
+4. Select a random millisecond delay.
+5. Kill the open process using SIGKILL.
+6. Start kvdb open again.
+7. Run kvdb check.
+8. Run kvdb dump.
+9. Verify recovered state against the independent oracle.
+
+TEST:
+
+Perform repeated recovery interruptions.
+
+Use sufficiently large databases to increase the recovery window.
+
+CRITICAL:
+
+If open finishes before SIGKILL, record:
+
+MISSED CRASH WINDOW
+
+Do not count this as a successful recovery-crash test.
+
+RECORD:
+
+- Recovery start time.
+- Requested kill delay.
+- Actual process exit status.
+- Whether SIGKILL occurred.
+- Recovery completion time.
+
+Verify the second recovery completes correctly.
+
+GIT COMMIT:
+
+test recovery crashes
+
+STOP after CP9.
+```
+
+
 
 

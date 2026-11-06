@@ -36,6 +36,15 @@ def get_data_path(db_path: str) -> str:
 
 def do_open(db_path: str) -> int:
     """Recovers database by replaying WAL into data file."""
+    # Support simulated recovery window duration for recovery-crash testing
+    delay_ms_str = os.environ.get("SUPERNOVA_RECOVERY_DELAY_MS")
+    if delay_ms_str:
+        try:
+            delay_sec = float(delay_ms_str) / 1000.0
+            time.sleep(delay_sec)
+        except ValueError:
+            pass
+
     wal = get_wal_path(db_path)
     data = get_data_path(db_path)
 

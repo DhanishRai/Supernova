@@ -96,6 +96,19 @@ class ChildProcessExitInfo:
 
 
 @dataclass
+class RecoveryCrashInfo:
+    """Detailed telemetry for recovery-crash executions (CP9)."""
+    recovery_start_time: float
+    requested_kill_delay_ms: float
+    actual_exit_status: Optional[int]
+    sigkill_occurred: bool
+    recovery_completion_time: Optional[float]
+    missed_crash_window: bool
+    second_recovery_success: bool
+    second_recovery_time_s: Optional[float] = None
+
+
+@dataclass
 class FailureDetails:
     """Comprehensive failure context required for professional reporting."""
     category: FailureCategory
@@ -111,6 +124,7 @@ class FailureDetails:
     actual_dump: Dict[str, str] = field(default_factory=dict)
     operation_ids: List[str] = field(default_factory=list)
     operation_types: List[str] = field(default_factory=list)
+    recovery_info: Optional[RecoveryCrashInfo] = None
 
 
 def classify_failure(
@@ -196,6 +210,9 @@ class IterationReport:
     recovered_keys: int
     duration_s: float
     violations: List[str]
+    mode: str = "default"
+    missed_crash_window: bool = False
+    recovery_info: Optional[RecoveryCrashInfo] = None
 
 
 class Reporter:
@@ -206,15 +223,35 @@ class Reporter:
 
     def print_iteration_summary(self, rep: IterationReport) -> None:
         """Prints a single clean progress line per iteration."""
-        status_tag = "\033[92m[PASS]\033[0m" if rep.passed else "\033[91m[FAIL]\033[0m"
-        line = (
-            f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
-            f"delay={rep.delay_ms:02d}ms "
-            f"ops={rep.submitted:03d} "
-            f"ack={rep.acked:03d} "
-            f"keys={rep.recovered_keys:03d} "
-            f"({rep.duration_s:.3f}s)"
-        )
+        if rep.missed_crash_window:
+            status_tag = "\033[93m[MISSED CRASH WINDOW]\033[0m"
+            exit_code = rep.recovery_info.actual_exit_status if rep.recovery_info else "unknown"
+            line = (
+                f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
+                f"delay={rep.delay_ms:02d}ms "
+                f"(open finished before SIGKILL; not counted) "
+                f"exit_status={exit_code} "
+                f"({rep.duration_s:.3f}s)"
+            )
+        else:
+            status_tag = "\033[92m[PASS]\033[0m" if rep.passed else "\033[91m[FAIL]\033[0m"
+            if rep.mode == "recovery-crash":
+                line = (
+                    f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
+                    f"delay={rep.delay_ms:02d}ms "
+                    f"(recovery interrupted by SIGKILL; 2nd open OK) "
+                    f"keys={rep.recovered_keys:03d} "
+                    f"({rep.duration_s:.3f}s)"
+                )
+            else:
+                line = (
+                    f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
+                    f"delay={rep.delay_ms:02d}ms "
+                    f"ops={rep.submitted:03d} "
+                    f"ack={rep.acked:03d} "
+                    f"keys={rep.recovered_keys:03d} "
+                    f"({rep.duration_s:.3f}s)"
+                )
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
@@ -404,6 +441,16 @@ class Reporter:
             "available_stderr": list(details.stderr_lines) if details.stderr_lines is not None else [],
             "mismatched_keys": mismatched_keys_data,
             "errors": details.errors,
+            "recovery_crash_info": {
+                "recovery_start_time": details.recovery_info.recovery_start_time,
+                "requested_kill_delay_ms": details.recovery_info.requested_kill_delay_ms,
+                "actual_process_exit_status": details.recovery_info.actual_exit_status,
+                "sigkill_occurred": details.recovery_info.sigkill_occurred,
+                "recovery_completion_time": details.recovery_info.recovery_completion_time,
+                "missed_crash_window": details.recovery_info.missed_crash_window,
+                "second_recovery_success": details.recovery_info.second_recovery_success,
+                "second_recovery_time_s": details.recovery_info.second_recovery_time_s,
+            } if details.recovery_info else None,
             "reproducibility_notice": REPRODUCIBILITY_NOTICE,
         }
         report_json_file = os.path.join(dest_dir, "failure_report.json")
@@ -424,6 +471,19 @@ class Reporter:
             f.write(f"Database Path      : {details.db_path}\n")
             f.write(f"Total Op IDs       : {len(details.operation_ids)}\n")
             f.write(f"Operation Types    : {', '.join(details.operation_types) if details.operation_types else 'None'}\n\n")
+
+            if details.recovery_info:
+                f.write("--- RECOVERY-CRASH INTERRUPT TELEMETRY ---\n")
+                f.write(f"Recovery Start Time        : {details.recovery_info.recovery_start_time:.6f}\n")
+                f.write(f"Requested Kill Delay       : {details.recovery_info.requested_kill_delay_ms:.2f} ms\n")
+                f.write(f"Actual Process Exit Status : {details.recovery_info.actual_exit_status}\n")
+                f.write(f"Whether SIGKILL Occurred   : {details.recovery_info.sigkill_occurred}\n")
+                f.write(f"Recovery Completion Time   : {details.recovery_info.recovery_completion_time}\n")
+                f.write(f"Missed Crash Window        : {details.recovery_info.missed_crash_window}\n")
+                f.write(f"Second Recovery Succeeded  : {details.recovery_info.second_recovery_success}\n")
+                if details.recovery_info.second_recovery_time_s is not None:
+                    f.write(f"Second Recovery Duration   : {details.recovery_info.second_recovery_time_s:.4f} s\n")
+                f.write("\n")
 
             f.write("--- CHILD PROCESS EXIT INFORMATION ---\n")
             if details.child_exit:

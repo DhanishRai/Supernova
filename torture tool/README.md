@@ -103,6 +103,34 @@ The torture tool is an adversarial testing harness designed to break our Go key-
 - **`tests/test_reporting.py`**:
   - Validates artifact preservation, structured JSON report fields, large-value memory bounding (hashes/lengths), cryptographic SHA-256 correctness, deterministic workload reproduction, classification taxonomy, and harness crash safety.
 
+### CP9: Recovery-Crash Mode (`--mode recovery-crash`)
+- **Adversarial Recovery Interruption Workflow**:
+  1. Creates a database with acknowledged operations (sufficient volume across PUT, DEL, and BATCH to enlarge the recovery replay window).
+  2. Kills the `serve` process, leaving uncompacted write-ahead logs on disk.
+  3. Starts `kvdb open` as a background process.
+  4. Waits for a random millisecond delay.
+  5. Injects `SIGKILL` directly into the executing `open` process.
+  6. Starts `kvdb open` a second time to ensure recovery idempotency.
+  7. Runs `kvdb check` for structural file integrity.
+  8. Runs `kvdb dump` to extract recovered key-value records.
+  9. Evaluates recovered data against the independent **Oracle** to guarantee zero data loss.
+- **`MISSED CRASH WINDOW` Detection**:
+  - If `kvdb open` terminates before `SIGKILL` arrives, the test records `MISSED CRASH WINDOW`.
+  - **Invariance**: Missed crash windows are strictly excluded from the count of successful recovery-crash tests.
+- **Mandatory Metric & Telemetry Recording**:
+  - `recovery_start_time`: High-precision timestamp when recovery began.
+  - `requested_kill_delay_ms`: Randomized sleep duration before `SIGKILL`.
+  - `actual_process_exit_status`: Exit code or terminating signal (e.g., `-9` / `137` on SIGKILL, or `0` on clean exit).
+  - `whether_sigkill_occurred`: Boolean flag confirming if process was actively killed while running.
+  - `recovery_completion_time`: High-precision timestamp when recovery process ended.
+  - `second_recovery_success`: Confirms subsequent recovery succeeds without error.
+- **`tests/test_recovery_crash.py`**:
+  - Tests recovery interruption mid-flight with verified second recovery.
+  - Tests missed crash window detection and exclusion.
+  - Tests telemetry field recording.
+  - Tests second recovery failure artifact preservation.
+  - Tests repeated multi-iteration recovery crash resilience.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash
