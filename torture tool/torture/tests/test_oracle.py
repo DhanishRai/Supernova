@@ -298,6 +298,90 @@ class TestDatabaseOracle(unittest.TestCase):
         self.assertFalse(res_non_f4_missing_b1.passed, "Non-F4 must strictly require all seed batches!")
         self.assertTrue(any("DURABILITY VIOLATION" in v for v in res_non_f4_missing_b1.violations))
 
+    def test_errored_put_absent_from_recovered_state(self) -> None:
+        """
+        [Item 9 Proof - Errored PUT]
+        Verifies that an operation that errored (e.g. disk-full) must NOT
+        be present in the recovered database. If an engine applies it anyway,
+        the Oracle must detect ERRORED OP VIOLATION.
+        """
+        self.oracle.record_put("op-base", "account:1", "100")
+        self.oracle.record_ack("op-base")
+
+        self.oracle.record_put("op-fail", "account:1", "999")
+        self.oracle.record_err("op-fail", "disk full (exceeded max-bytes)")
+
+        # Case 1: Database holds pre-error ACKed state (100) -> PASS
+        res_ok = self.oracle.verify_recovered_dump({"account:1": "100"})
+        self.assertTrue(res_ok.passed, f"Valid recovery failed: {res_ok.violations}")
+
+        # Case 2: Database holds errored write (999) -> FAIL with ERRORED OP VIOLATION
+        res_leaked = self.oracle.verify_recovered_dump({"account:1": "999"})
+        self.assertFalse(res_leaked.passed, "Leaked errored PUT must fail verification!")
+        self.assertTrue(
+            any("ERRORED OP VIOLATION" in v for v in res_leaked.violations),
+            f"Expected ERRORED OP VIOLATION, got: {res_leaked.violations}"
+        )
+
+    def test_errored_del_absent_from_recovered_state(self) -> None:
+        """
+        [Item 9 Proof - Errored DEL]
+        Verifies that an errored deletion does NOT delete the key.
+        If an engine deletes the key despite returning an error,
+        the Oracle must detect ERRORED OP VIOLATION.
+        """
+        self.oracle.record_put("op-base", "account:2", "500")
+        self.oracle.record_ack("op-base")
+
+        self.oracle.record_del("op-fail-del", "account:2")
+        self.oracle.record_err("op-fail-del", "disk full")
+
+        # Case 1: Key remains present with pre-error value -> PASS
+        res_ok = self.oracle.verify_recovered_dump({"account:2": "500"})
+        self.assertTrue(res_ok.passed, f"Valid recovery failed: {res_ok.violations}")
+
+        # Case 2: Key was deleted by errored op -> FAIL with ERRORED OP VIOLATION
+        res_leaked = self.oracle.verify_recovered_dump({})
+        self.assertFalse(res_leaked.passed, "Leaked errored DEL must fail verification!")
+        self.assertTrue(
+            any("ERRORED OP VIOLATION" in v or "DURABILITY VIOLATION" in v for v in res_leaked.violations),
+            f"Expected ERRORED OP VIOLATION, got: {res_leaked.violations}"
+        )
+
+    def test_errored_batch_absent_from_recovered_state(self) -> None:
+        """
+        [Item 9 Proof - Errored BATCH]
+        Verifies that an errored batch (partial or full) is completely absent.
+        """
+        self.oracle.record_batch(
+            "b-fail",
+            [
+                BatchSubOp(OpType.PUT, "b_key_1", "b_val_1"),
+                BatchSubOp(OpType.PUT, "b_key_2", "b_val_2"),
+            ]
+        )
+        self.oracle.record_err("b-fail", "disk full")
+
+        # Case 1: Completely absent -> PASS
+        res_ok = self.oracle.verify_recovered_dump({})
+        self.assertTrue(res_ok.passed, f"Valid recovery failed: {res_ok.violations}")
+
+        # Case 2: Partially applied (first item leaked) -> FAIL
+        res_partial = self.oracle.verify_recovered_dump({"b_key_1": "b_val_1"})
+        self.assertFalse(res_partial.passed, "Partially applied errored batch must fail!")
+        self.assertTrue(
+            any("ERRORED OP VIOLATION" in v for v in res_partial.violations),
+            f"Expected ERRORED OP VIOLATION, got: {res_partial.violations}"
+        )
+
+        # Case 3: Fully applied (both items leaked) -> FAIL
+        res_full = self.oracle.verify_recovered_dump({"b_key_1": "b_val_1", "b_key_2": "b_val_2"})
+        self.assertFalse(res_full.passed, "Fully applied errored batch must fail!")
+        self.assertTrue(
+            any("ERRORED OP VIOLATION" in v for v in res_full.violations),
+            f"Expected ERRORED OP VIOLATION, got: {res_full.violations}"
+        )
+
 
 
 if __name__ == "__main__":

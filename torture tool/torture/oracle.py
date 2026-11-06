@@ -595,6 +595,89 @@ class DatabaseOracle:
                     elif visible_count == 0:
                         unacked_discarded.append(op.op_id)
 
+            # 6. Check Errored Operations Absence:
+            # An operation that was rejected with an explicit error (e.g. disk full ERR)
+            # must NEVER have any of its writes or deletions reflected in the database.
+            errored_ops = [op for op in self._history if op.errored]
+            for op in errored_ops:
+                state_before = get_state_before(op.seq)
+
+                if op.op_type == OpType.PUT:
+                    assert op.key is not None and op.value is not None
+                    if actual_dump.get(op.key) == op.value and state_before.get(op.key) != op.value:
+                        valid_explanation = any(
+                            o.op_id != op.op_id and not o.errored and (
+                                (o.op_type == OpType.PUT and o.key == op.key and o.value == op.value) or
+                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == op.key and s.value == op.value for s in o.batch_items))
+                            ) and (
+                                (o.seq < op.seq and o.op_id in unacked_committed) or
+                                (o.seq > op.seq or were_concurrent(o, op))
+                            )
+                            for o in self._history
+                        )
+                        if not valid_explanation:
+                            violations.append(
+                                f"ERRORED OP VIOLATION: Operation '{op.op_id}' errored ({op.error_message}), "
+                                f"but its PUT key '{op.key}' with value {format_val_summary(op.value)} is present in recovered database!"
+                            )
+
+                elif op.op_type == OpType.DEL:
+                    assert op.key is not None
+                    if op.key in state_before and op.key not in actual_dump:
+                        valid_del = any(
+                            o.op_id != op.op_id and not o.errored and (
+                                (o.op_type == OpType.DEL and o.key == op.key) or
+                                (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == op.key for s in o.batch_items))
+                            ) and (
+                                (o.seq < op.seq and o.op_id in unacked_committed) or
+                                (o.seq > op.seq or were_concurrent(o, op))
+                            )
+                            for o in self._history
+                        )
+                        if not valid_del:
+                            violations.append(
+                                f"ERRORED OP VIOLATION: Operation '{op.op_id}' errored ({op.error_message}), "
+                                f"but its DEL of key '{op.key}' was applied (key is missing from recovered database)!"
+                            )
+
+                elif op.op_type == OpType.BATCH:
+                    for sub in op.batch_items:
+                        if sub.op_type == OpType.PUT:
+                            assert sub.value is not None
+                            if actual_dump.get(sub.key) == sub.value and state_before.get(sub.key) != sub.value:
+                                valid_explanation = any(
+                                    o.op_id != op.op_id and not o.errored and (
+                                        (o.op_type == OpType.PUT and o.key == sub.key and o.value == sub.value) or
+                                        (o.op_type == OpType.BATCH and any(s.op_type == OpType.PUT and s.key == sub.key and s.value == sub.value for s in o.batch_items))
+                                    ) and (
+                                        (o.seq < op.seq and o.op_id in unacked_committed) or
+                                        (o.seq > op.seq or were_concurrent(o, op))
+                                    )
+                                    for o in self._history
+                                )
+                                if not valid_explanation:
+                                    violations.append(
+                                        f"ERRORED OP VIOLATION: Batch '{op.op_id}' errored ({op.error_message}), "
+                                        f"but its sub-op PUT key '{sub.key}' with value {format_val_summary(sub.value)} was applied to recovered database!"
+                                    )
+                        elif sub.op_type == OpType.DEL:
+                            if sub.key in state_before and sub.key not in actual_dump:
+                                valid_del = any(
+                                    o.op_id != op.op_id and not o.errored and (
+                                        (o.op_type == OpType.DEL and o.key == sub.key) or
+                                        (o.op_type == OpType.BATCH and any(s.op_type == OpType.DEL and s.key == sub.key for s in o.batch_items))
+                                    ) and (
+                                        (o.seq < op.seq and o.op_id in unacked_committed) or
+                                        (o.seq > op.seq or were_concurrent(o, op))
+                                    )
+                                    for o in self._history
+                                )
+                                if not valid_del:
+                                    violations.append(
+                                        f"ERRORED OP VIOLATION: Batch '{op.op_id}' errored ({op.error_message}), "
+                                        f"but its sub-op DEL of key '{sub.key}' was applied (key is missing from recovered database)!"
+                                    )
+
             passed = (len(violations) == 0)
             return VerificationResult(
                 passed=passed,

@@ -204,7 +204,7 @@ class TestDiskFullMode(unittest.TestCase):
             data = json.load(f)
         self.assertIn(data["failure_category"], ["Oracle failure", "Engine failure"])
         self.assertTrue(
-            any("ATOMICITY VIOLATION" in err or "INTEGRITY VIOLATION" in err for err in data["errors"])
+            any("ATOMICITY VIOLATION" in err or "INTEGRITY VIOLATION" in err or "ERRORED OP VIOLATION" in err for err in data["errors"])
         )
 
 
