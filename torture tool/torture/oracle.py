@@ -24,9 +24,33 @@ Core Responsibilities:
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple, Union
+
+
+def hash_val(val: Optional[str]) -> str:
+    """Returns a short SHA-256 hex digest for reporting."""
+    if val is None:
+        return "<none>"
+    return hashlib.sha256(val.encode("utf-8")).hexdigest()[:16]
+
+
+def format_val_summary(val: Optional[str], max_len: int = 64) -> str:
+    """
+    Formats a value for safe console/log display without printing large payloads.
+    If len(val) <= max_len and has no newlines, returns repr(val).
+    Otherwise returns length, SHA-256 digest, and a concise snippet.
+    """
+    if val is None:
+        return "<none>"
+    length = len(val)
+    if length <= max_len and "\n" not in val and "\r" not in val:
+        return repr(val)
+    h = hash_val(val)
+    snippet = repr(val[:24] + "..." if length > 24 else val)
+    return f"<len={length}, sha256={h}, preview={snippet}>"
 
 
 class OpType(str, Enum):
@@ -50,6 +74,10 @@ class BatchSubOp:
         if self.op_type == OpType.DEL and self.value is not None:
             raise ValueError("DEL sub-op cannot have a value")
 
+    def __repr__(self) -> str:
+        v_str = f", val={format_val_summary(self.value)}" if self.value is not None else ""
+        return f"BatchSubOp({self.op_type.value}, key='{self.key}'{v_str})"
+
 
 @dataclass
 class OperationRecord:
@@ -67,6 +95,14 @@ class OperationRecord:
     error_message: Optional[str] = None
     resolved_at: Optional[float] = None
 
+    def __repr__(self) -> str:
+        v_str = f", val={format_val_summary(self.value)}" if self.value is not None else ""
+        k_str = f", key='{self.key}'" if self.key is not None else ""
+        return (
+            f"OpRecord({self.op_id}, {self.op_type.value}{k_str}{v_str}, "
+            f"acked={self.acked}, seq={self.seq})"
+        )
+
 
 @dataclass(frozen=True)
 class KeyProvenance:
@@ -76,6 +112,11 @@ class KeyProvenance:
     op_id: str
     seq: int
     is_deleted: bool
+
+    def __repr__(self) -> str:
+        v_str = f", val={format_val_summary(self.value)}" if self.value is not None else ""
+        del_str = ", DELETED" if self.is_deleted else ""
+        return f"Provenance(key='{self.key}', op='{self.op_id}', seq={self.seq}{del_str}{v_str})"
 
 
 @dataclass
@@ -309,8 +350,8 @@ class DatabaseOracle:
                 valid_values = historical_values_per_key.get(key, set())
                 if val not in valid_values:
                     violations.append(
-                        f"INTEGRITY VIOLATION: Key '{key}' holds value '{val}' which was NEVER written to it! "
-                        f"(Known historical values for this key: {valid_values})"
+                        f"INTEGRITY VIOLATION: Key '{key}' holds value {format_val_summary(val)} "
+                        f"which was NEVER written to it! (Known historical values count: {len(valid_values)})"
                     )
 
             # 3. Check Durability: Every ACKed key must be present with the ACKed value
@@ -358,7 +399,8 @@ class DatabaseOracle:
 
                     if not can_be_deleted:
                         violations.append(
-                            f"DURABILITY VIOLATION: ACKed key '{key}' with value '{expected_val}' is MISSING from recovered database!"
+                            f"DURABILITY VIOLATION: ACKed key '{key}' with value {format_val_summary(expected_val)} "
+                            f"is MISSING from recovered database!"
                         )
                 else:
                     actual_val = actual_dump[key]
@@ -385,7 +427,8 @@ class DatabaseOracle:
 
                         if not can_be_overwritten:
                             violations.append(
-                                f"DURABILITY VIOLATION: ACKed key '{key}' expected '{expected_val}', but found '{actual_val}'!"
+                                f"DURABILITY VIOLATION: ACKed key '{key}' expected {format_val_summary(expected_val)}, "
+                                f"but found {format_val_summary(actual_val)}!"
                             )
 
             # 4. Check Deleted Keys: Keys ACKed as deleted must NOT be present
@@ -411,7 +454,8 @@ class DatabaseOracle:
 
                     if not can_be_recreated:
                         violations.append(
-                            f"DELETION VIOLATION: Key '{key}' was ACKed as deleted by op '{prov.op_id}', but is still present with value '{actual_dump[key]}'!"
+                            f"DELETION VIOLATION: Key '{key}' was ACKed as deleted by op '{prov.op_id}', "
+                            f"but is still present with value {format_val_summary(actual_val)}!"
                         )
 
             # Helper to compute definite state prior to a given operation sequence
@@ -466,23 +510,41 @@ class DatabaseOracle:
                 total_items = len(informative_effects)
 
                 if 0 < visible_count < total_items:
-                    # Potential torn batch! Check if the non-visible keys were overwritten by later ops
-                    is_torn = False
+                    # A batch is torn ONLY IF:
+                    # 1) At least one effect definitely took effect (cannot be explained without this batch)
+                    # AND
+                    # 2) At least one effect definitely did NOT take effect (cannot be explained by later/concurrent overwrites)
+                    definitely_applied = False
+                    for sub_k, is_vis in informative_effects:
+                        if is_vis:
+                            sub_op = net_batch_ops[sub_k]
+                            if sub_op.op_type == OpType.PUT:
+                                other_writers = any(
+                                    o.op_id != op.op_id and (
+                                        (o.op_type == OpType.PUT and o.key == sub_k and o.value == sub_op.value) or
+                                        (o.op_type == OpType.BATCH and any(s.key == sub_k and s.value == sub_op.value for s in o.batch_items))
+                                    )
+                                    for o in self._history
+                                )
+                                if not other_writers:
+                                    definitely_applied = True
+                                    break
+
+                    definitely_missing = False
                     for sub_k, is_vis in informative_effects:
                         if not is_vis:
-                            # If no subsequent op touched this key, then this batch was torn!
-                            subsequent_writes = [
-                                o for o in self._history
-                                if o.seq > op.seq and (
+                            can_be_overwritten = any(
+                                o.op_id != op.op_id and (o.seq > op.seq or were_concurrent(o, op)) and (
                                     o.key == sub_k or
                                     (o.op_type == OpType.BATCH and any(s.key == sub_k for s in o.batch_items))
                                 )
-                            ]
-                            if not subsequent_writes:
-                                is_torn = True
+                                for o in self._history
+                            )
+                            if not can_be_overwritten:
+                                definitely_missing = True
                                 break
 
-                    if is_torn:
+                    if definitely_applied and definitely_missing:
                         violations.append(
                             f"ATOMICITY VIOLATION: Batch '{op.op_id}' was torn! "
                             f"{visible_count} of {total_items} distinct key effects visible in dump."

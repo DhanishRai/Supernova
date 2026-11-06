@@ -33,6 +33,29 @@ class WriterWorkloadType(str, Enum):
     BATCH_ONLY = "batch"  # 100% BATCH
 
 
+def generate_large_value(op_id: str, writer_id: str, key: str, size: int = 1024 * 1024) -> str:
+    """
+    Generates a deterministic, distinguishable large value payload (~1 MB).
+    
+    Structure:
+    - Header: SUPERNOVA_LARGE_VAL:<op_id>:<writer_id>:<key>:len=<size>:
+    - Body: Deterministic pattern repeated to exact target size
+    
+    Guarantees:
+    - Exact byte length matching `size`
+    - Distinguishable across writers, operations, and keys
+    - Instantly detects truncation, corruption, partial persistence, or missed overwrites
+    """
+    prefix = f"SUPERNOVA_LARGE_VAL:{op_id}:{writer_id}:{key}:len={size}:"
+    pattern = f"[{op_id}#{writer_id}]"
+    remaining = size - len(prefix)
+    if remaining <= 0:
+        return prefix[:size]
+    repeats = remaining // len(pattern)
+    tail = remaining % len(pattern)
+    return prefix + (pattern * repeats) + pattern[:tail]
+
+
 class ConcurrentWriter:
     """
     Independent worker thread for concurrent stress testing.
@@ -58,9 +81,11 @@ class ConcurrentWriter:
         # Unique namespaced ID generator prevents cross-thread ID collisions
         self.id_gen = IdGenerator(prefix=f"{writer_id}-op")
 
-        # Key pool (shared or isolated)
+        # Key pool (shared or isolated). In large-values mode, default to a small shared pool
         if key_pool is not None:
             self._keys = list(key_pool)
+        elif self.mode == TortureMode.LARGE_VALUES:
+            self._keys = [f"shared_key_{i}" for i in range(4)]
         else:
             self._keys = [f"key_{i:04d}" for i in range(50)]
 
@@ -89,11 +114,10 @@ class ConcurrentWriter:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
 
-    def _generate_value(self) -> str:
+    def _generate_value(self, key: str = "", op_id: str = "") -> str:
         """Generates payload value based on mode."""
         if self.mode == TortureMode.LARGE_VALUES:
-            chunk = "V" * 1024
-            return chunk * 1024
+            return generate_large_value(op_id=op_id, writer_id=self.writer_id, key=key, size=1024 * 1024)
         rand_suffix = self.rng.randint(1000, 9999)
         return f"{self.writer_id}_val_{self.submitted_count}_{rand_suffix}"
 
@@ -124,7 +148,7 @@ class ConcurrentWriter:
 
                 if chosen_type == "PUT":
                     key = self.rng.choice(self._keys)
-                    val = self._generate_value()
+                    val = self._generate_value(key=key, op_id=op_id)
 
                     self.oracle.record_put(op_id, key, val, writer_id=self.writer_id)
                     self.submitted_count += 1
@@ -150,18 +174,21 @@ class ConcurrentWriter:
                         self.oracle.record_err(op_id, resp.message or "error")
 
                 elif chosen_type == "BATCH":
-                    batch_size = (
-                        self.rng.randint(50, 200)
-                        if self.mode == TortureMode.LARGE_BATCHES
-                        else self.rng.randint(2, 6)
-                    )
+                    if self.mode == TortureMode.LARGE_BATCHES:
+                        batch_size = self.rng.randint(50, 200)
+                    elif self.mode == TortureMode.LARGE_VALUES:
+                        batch_size = self.rng.randint(2, 3)
+                    else:
+                        batch_size = self.rng.randint(2, 6)
+
                     batch_oracle_items: List[BatchSubOp] = []
                     batch_proto_items: List[BatchItem] = []
 
-                    for _ in range(batch_size):
+                    for idx in range(batch_size):
                         sub_key = self.rng.choice(self._keys)
                         if self.rng.random() < 0.70:
-                            sub_val = self._generate_value()
+                            sub_op_id = f"{op_id}-s{idx}"
+                            sub_val = self._generate_value(key=sub_key, op_id=sub_op_id)
                             batch_oracle_items.append(BatchSubOp(OpType.PUT, sub_key, sub_val))
                             batch_proto_items.append(BatchItem.make_put(sub_key, sub_val))
                         else:

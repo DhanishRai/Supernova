@@ -53,6 +53,18 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - Accepts any valid linearization of concurrent in-flight writes without weakening baseline durability or integrity.
 - **`tests/test_concurrency.py`**: Exercises all 6 mandated concurrency stress scenarios.
 
+### CP6: Shared-Key Testing and Large Values (`--mode large-values`)
+- **`worker.py` (`generate_large_value`)**:
+  - Deterministic ~1 MB ($1,048,576$ bytes) payloads structured with headers: `SUPERNOVA_LARGE_VAL:<op_id>:<writer_id>:<key>:len=1048576:` followed by repeating op-tagged chunks.
+  - Defaults to small shared key pools (`shared_key_0` .. `shared_key_3`) when in `large-values` mode to force maximum concurrent contention, log head contention, and repeated overwrites.
+- **Memory Efficiency & Bounded Failure Reports**:
+  - `oracle.py`: Custom `format_val_summary()` truncates values $>64$ bytes to `<len=..., sha256=..., preview='...'>`.
+  - `verifier.py`: Formats SHA-256 hex digests and byte lengths; never dumps 1 MB raw strings into console or error buffers.
+  - `reporting.py`: Failure artifacts in `oracle_history.json` and `recovered_dump.json` store cryptographic hashes and lengths for values $>256$ bytes, preventing disk explosion.
+- **`tests/test_large_values.py`**:
+  - Exercises all 7 mandated scenarios: Large PUT, Large overwrite, Large values across multiple keys, Large value followed by DELETE, Repeated large writes on shared keys, Kill during transmission, Kill during processing.
+  - Verifies defect detection: Truncated values, corrupted bytes, incorrect hex decoding, partial persistence / torn records, and incorrect overwrites.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

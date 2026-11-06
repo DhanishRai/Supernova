@@ -21,7 +21,7 @@ import sys
 import time
 from typing import Optional
 
-from torture.config import TortureConfig
+from torture.config import TortureConfig, TortureMode
 from torture.oracle import DatabaseOracle
 from torture.protocol import EngineClient
 from torture.reporting import IterationReport, Reporter
@@ -97,6 +97,11 @@ class CrashTestRunner:
 
             # 4. Start concurrent active writers
             num_workers = max(1, self.config.workers)
+            shared_key_pool = (
+                [f"shared_key_{i}" for i in range(4)]
+                if self.config.mode == TortureMode.LARGE_VALUES
+                else None
+            )
             workers = []
             for w_idx in range(1, num_workers + 1):
                 w_seed = iter_rng.randint(1, 100_000_000)
@@ -106,6 +111,7 @@ class CrashTestRunner:
                     rng=random.Random(w_seed),
                     mode=self.config.mode,
                     writer_id=f"w{w_idx}",
+                    key_pool=shared_key_pool,
                 )
                 workers.append(worker)
 

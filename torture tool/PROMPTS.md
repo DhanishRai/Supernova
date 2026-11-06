@@ -795,3 +795,71 @@ add concurrent writers
 
 STOP after CP5.
 ```
+
+
+---
+
+### Entry 8
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:35:00 IST
+- **Development Stage**: CP6 (Shared-Key Testing and Large Values)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP6: shared-key testing and large values.
+
+Add:
+
+--mode large-values
+
+OBJECTIVE:
+
+Generate values approximately 1 MB in size.
+
+TEST:
+
+1. Large PUT.
+2. Large overwrite.
+3. Large values across multiple keys.
+4. Large value followed by DELETE.
+5. Repeated large-value writes.
+6. Kill during large-value transmission.
+7. Kill during large-value processing.
+
+SHARED-KEY TESTING:
+
+Multiple writers must deliberately modify a small set of common keys.
+
+Use distinguishable values associated with operation IDs.
+
+MEMORY:
+
+Avoid unnecessary duplication of large values.
+
+Use hashes and lengths in failure reports.
+
+Retain sufficient information for exact value verification.
+
+TEST:
+
+Detect:
+- Truncated values.
+- Corrupted values.
+- Incorrect decoding.
+- Partial persistence.
+- Incorrect overwrites.
+
+Do not print entire large values.
+
+GIT COMMIT:
+
+test large values
+
+STOP after CP6.
+```
+

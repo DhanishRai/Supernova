@@ -52,20 +52,18 @@ class DumpParser:
             if not stripped:
                 continue
 
-            # Support "key value" or "key=value"
-            if "=" in stripped:
-                parts = stripped.split("=", 1)
-                k, v = parts[0].strip(), parts[1].strip()
+            # Support "key value" (standard) or "key=value" (alternative)
+            space_parts = stripped.split(maxsplit=1)
+            if len(space_parts) == 2:
+                k, v = space_parts[0].strip(), space_parts[1].strip()
+            elif len(space_parts) == 1 and "=" in space_parts[0]:
+                eq_parts = space_parts[0].split("=", 1)
+                k, v = eq_parts[0].strip(), eq_parts[1].strip()
+            elif len(space_parts) == 1:
+                k, v = space_parts[0].strip(), ""
             else:
-                parts = stripped.split(maxsplit=1)
-                if len(parts) == 1:
-                    # Key with empty value or malformed token
-                    k, v = parts[0].strip(), ""
-                elif len(parts) == 2:
-                    k, v = parts[0].strip(), parts[1].strip()
-                else:
-                    malformed.append(f"Line {idx+1}: {line}")
-                    continue
+                malformed.append(f"Line {idx+1}: {line}")
+                continue
 
             if not k:
                 malformed.append(f"Line {idx+1}: missing key in '{line}'")

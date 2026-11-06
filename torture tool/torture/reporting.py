@@ -11,9 +11,9 @@ import os
 import shutil
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from torture.oracle import DatabaseOracle
+from torture.oracle import DatabaseOracle, hash_val
 
 
 @dataclass
@@ -70,6 +70,17 @@ class Reporter:
         if os.path.exists(db_path):
             shutil.copy2(db_path, os.path.join(dest_dir, "corrupted_target.db"))
 
+        def summarize_val(v: Optional[str]) -> Any:
+            if v is None:
+                return None
+            if len(v) <= 256:
+                return v
+            return {
+                "length": len(v),
+                "sha256": hash_val(v),
+                "preview": v[:32],
+            }
+
         # 2. Write the Oracle history
         history_file = os.path.join(dest_dir, "oracle_history.json")
         history_records = [
@@ -79,12 +90,16 @@ class Reporter:
                 "seq": op.seq,
                 "writer_id": op.writer_id,
                 "key": op.key,
-                "value": op.value,
+                "value": summarize_val(op.value),
                 "acked": op.acked,
                 "errored": op.errored,
                 "error_message": op.error_message,
                 "batch_items": [
-                    {"op_type": b.op_type.value, "key": b.key, "value": b.value}
+                    {
+                        "op_type": b.op_type.value,
+                        "key": b.key,
+                        "value": summarize_val(b.value),
+                    }
                     for b in op.batch_items
                 ],
             }
@@ -93,10 +108,11 @@ class Reporter:
         with open(history_file, "w", encoding="utf-8") as f:
             json.dump(history_records, f, indent=2)
 
-        # 3. Write actual recovered dump
+        # 3. Write actual recovered dump summary
         dump_file = os.path.join(dest_dir, "recovered_dump.json")
+        dump_summary = {k: summarize_val(v) for k, v in actual_dump.items()}
         with open(dump_file, "w", encoding="utf-8") as f:
-            json.dump(actual_dump, f, indent=2)
+            json.dump(dump_summary, f, indent=2)
 
         # 4. Write full error report
         report_file = os.path.join(dest_dir, "diagnostic_report.txt")
