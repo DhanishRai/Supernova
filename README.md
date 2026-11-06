@@ -27,7 +27,7 @@ srinathon-3.0/
 │   │   └── README.md
 │   └── torture/              # [Teammate 1] Autonomous torture-testing & kill tool
 │       └── README.md
-├── src/                      # [Our Component] Core database engine (package killitdb)
+├── engine/                   # [Our Component] Core database engine (package killitdb)
 │   ├── batch.go              # Atomic multi-operation batch writes
 │   ├── database.go           # DB handle, 16-byte header, file lifecycle
 │   ├── index.go              # In-memory hash index (key -> disk offset/len)
@@ -36,6 +36,7 @@ srinathon-3.0/
 │   ├── recovery.go           # Crash-safe sequential recovery scan & torn-tail truncation
 │   ├── storage.go            # Durable append, WriteAt, fsync, and rollback
 │   └── *_test.go             # 94 unit, concurrency, recovery, and invariant tests
+├── torture tool/             # [Teammate 1] Autonomous torture-testing & kill tool
 ├── go.mod                    # Root module definition (module killitdb)
 ├── README.md                 # Project architecture & status
 └── TEST_PLAN.md              # 11-layer end-to-end testing & crash verification plan
@@ -44,13 +45,12 @@ srinathon-3.0/
 ### Component Ownership
 | Component | Directory | Package | Ownership | Responsibility |
 |---|---|---|---|---|
-| **Database Engine Core** | `src/` | `killitdb` | **Our Role** | Storage format, atomic batch, durable sync, recovery, in-memory index. |
-| **Torture Testing Tool** | `cmd/torture/` | `main` | **Teammate 1** | Process kill injector (`kill -9`), seed-based fuzzing, crash validation. |
-| **CLI & Server** | `cmd/kvdb/` | `main` | **Teammate 2** | Terminal CLI commands (`put`, `get`, `del`, `dump`), server daemon, compaction. |
+| **Database Engine Core** | `engine/` | `killitdb` | **Our Role** | Storage format, atomic batch, durable sync, recovery, in-memory index. |
+| **Torture Testing Tool** | `torture tool/` | Python / harness | **Teammate 1** | Process kill injector (`kill -9`), seed-based fuzzing, crash validation. |
 
-Both `cmd/kvdb` and `cmd/torture` import the engine directly via:
+To import the engine in Go:
 ```go
-import "killitdb/src"
+import "killitdb/engine"
 ```
 
 ---
@@ -182,11 +182,11 @@ When `Open(path, maxBytes)` is called:
 | **Total allocations during recovery** | ~275 MB cumulative |
 | **Spot-check correctness** | 1,000 / 1,000 random keys correct |
 
-**Test environment:** Windows 11, Go 1.27.3 (windows/amd64), local SSD, `go test -run TestRecovery_MillionKeys -timeout 300s ./src/`
+**Test environment:** Windows 11, Go 1.27.3 (windows/amd64), local SSD, `go test -run TestRecovery_MillionKeys -timeout 300s ./engine/`
 
 **Test command:**
 ```bash
-go test -v -run TestRecovery_MillionKeys -timeout 300s ./src/
+go test -v -run TestRecovery_MillionKeys -timeout 300s ./engine/
 ```
 
 **Key optimizations applied during Step 9 (without weakening correctness):**

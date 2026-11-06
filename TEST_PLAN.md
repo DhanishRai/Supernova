@@ -164,8 +164,8 @@ Repeat 10 times at varied timings (mid-write, post-ACK, pre-ACK):
 
 Execute via Go test suite:
 ```bash
-go test -v -run TestInvariant10_ConcurrentGetAndWritesRaceFree ./src/
-go test -v -run TestBatch_ConcurrentGetNeverSeesPartialBatch ./src/
+go test -v -run TestInvariant10_ConcurrentGetAndWritesRaceFree ./engine/
+go test -v -run TestBatch_ConcurrentGetNeverSeesPartialBatch ./engine/
 ```
 *When CGO compiler is present:*
 ```bash
@@ -182,7 +182,7 @@ go test -race ./...
 
 ### Test Command:
 ```bash
-go test -v -run TestRecovery_MillionKeys -timeout 300s ./src/
+go test -v -run TestRecovery_MillionKeys -timeout 300s ./engine/
 ```
 ### Execution Steps:
 1. Append 1,000,000 distinct keys in batches of 10,000 operations (`Batch()`).
@@ -275,18 +275,18 @@ Temporarily introduce deliberate bugs in a scratch copy to verify testing detect
    ```
 4. **Invariant verification:**
    ```bash
-   go test -v -run TestInvariant ./src/
+   go test -v -run TestInvariant ./engine/
    ```
 5. **Scale benchmark:**
    ```bash
-   go test -v -run TestRecovery_MillionKeys -timeout 300s ./src/
+   go test -v -run TestRecovery_MillionKeys -timeout 300s ./engine/
    ```
 
 ---
 
 ## Pass/Fail Verification Checklist
 
-- [x] All 10 Core Engine Invariants verified by automated test suite (`src/invariants_test.go`).
+- [x] All 10 Core Engine Invariants verified by automated test suite (`engine/invariants_test.go`).
 - [x] 1,000,000 keys recovered in < 2 seconds (**469.8 ms** measured).
 - [x] Defensive bounds checking prevents OOM on corrupted record lengths.
 - [x] IEEE CRC32 validates payload integrity; corrupted tail is cleanly truncated.
