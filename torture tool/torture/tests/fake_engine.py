@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Fake Storage Engine Process for Unit and Integration Testing of Protocol Client.
+Fake Storage Engine Process for Unit and Integration Testing of Torture Harness.
 
-Implements the agreed CLI interface:
+Implements all required CLI subcommands:
     fake_engine.py serve <path>
+    fake_engine.py open <path>
+    fake_engine.py check <path>
+    fake_engine.py dump <path>
 
-Reads commands from stdin:
-    PUT <id> <hexkey> <hexvalue>
-    DEL <id> <hexkey>
-    BATCH <id> P:<hexkey>:<hexvalue> D:<hexkey> ...
-    COMPACT <id>
-
-Responds on stdout:
-    ACK <id>
-    ERR <id> <message>
-
-Decodes hex keys and values to detect scripted test triggers.
+In serve mode, maintains an append-only WAL on disk with fsync before ACK,
+replaying upon `open` so it faithfully exhibits crash-consistency semantics
+for test verification.
 """
 
+import json
 import os
 import sys
 import time
@@ -30,10 +26,90 @@ def decode_hex(hex_str: str) -> str:
         return hex_str
 
 
-def main() -> int:
-    if len(sys.argv) < 3 or sys.argv[1] != "serve":
-        sys.stderr.write(f"Usage: {sys.argv[0]} serve <path>\n")
-        return 1
+def get_wal_path(db_path: str) -> str:
+    return db_path + ".wal"
+
+
+def get_data_path(db_path: str) -> str:
+    return db_path + ".data"
+
+
+def do_open(db_path: str) -> int:
+    """Recovers database by replaying WAL into data file."""
+    wal = get_wal_path(db_path)
+    data = get_data_path(db_path)
+
+    state = {}
+    if os.path.exists(data):
+        try:
+            with open(data, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+
+    if os.path.exists(wal):
+        try:
+            with open(wal, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        etype = entry.get("type")
+                        if etype == "PUT":
+                            state[entry["k"]] = entry["v"]
+                        elif etype == "DEL":
+                            state.pop(entry["k"], None)
+                        elif etype == "BATCH":
+                            for sub in entry.get("items", []):
+                                if sub["type"] == "PUT":
+                                    state[sub["k"]] = sub["v"]
+                                elif sub["type"] == "DEL":
+                                    state.pop(sub["k"], None)
+                    except json.JSONDecodeError:
+                        # Torn tail at crash point! Stop replay cleanly.
+                        break
+        except Exception:
+            pass
+
+    with open(data, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    sys.stdout.write(f"OPEN OK keys={len(state)} recovery_time=0.001s\n")
+    sys.stdout.flush()
+    return 0
+
+
+def do_check(db_path: str) -> int:
+    """Verifies file integrity."""
+    sys.stdout.write("OK\n")
+    sys.stdout.flush()
+    return 0
+
+
+def do_dump(db_path: str) -> int:
+    """Dumps all key-value pairs sorted by key."""
+    data = get_data_path(db_path)
+    state = {}
+    if os.path.exists(data):
+        try:
+            with open(data, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+
+    for k in sorted(state.keys()):
+        sys.stdout.write(f"{k} {state[k]}\n")
+    sys.stdout.flush()
+    return 0
+
+
+def do_serve(db_path: str) -> int:
+    wal_path = get_wal_path(db_path)
+    wal_file = open(wal_path, "a", encoding="utf-8")
 
     while True:
         try:
@@ -42,7 +118,6 @@ def main() -> int:
             break
 
         if not line:
-            # Stdin EOF
             break
 
         line = line.strip()
@@ -58,59 +133,46 @@ def main() -> int:
         cmd = parts[0].upper()
         op_id = parts[1]
 
-        # Decode payload for inspecting triggers
+        # Decode entire payload to inspect triggers
         decoded_payload = ""
+        k, v = "", ""
         if cmd == "PUT" and len(parts) >= 4:
-            decoded_payload = f"{decode_hex(parts[2])} {decode_hex(parts[3])}"
+            k = decode_hex(parts[2])
+            v = decode_hex(parts[3])
+            decoded_payload = f"{k} {v}"
         elif cmd == "DEL" and len(parts) >= 3:
-            decoded_payload = decode_hex(parts[2])
+            k = decode_hex(parts[2])
+            decoded_payload = k
         elif cmd == "BATCH" and len(parts) >= 3:
-            items = []
-            for item in parts[2:]:
-                if item.startswith("P:"):
-                    subparts = item.split(":")
-                    if len(subparts) == 3:
-                        items.append(f"{decode_hex(subparts[1])}:{decode_hex(subparts[2])}")
-                elif item.startswith("D:"):
-                    subparts = item.split(":")
-                    if len(subparts) == 2:
-                        items.append(decode_hex(subparts[1]))
-            decoded_payload = " ".join(items)
-        else:
             decoded_payload = " ".join(parts[2:])
 
-        # 1. Trigger stderr output (testing stderr drain)
+        # Triggers for unit testing
         if "TRIGGER_STDERR:" in decoded_payload:
             idx = decoded_payload.find("TRIGGER_STDERR:")
             msg = decoded_payload[idx + len("TRIGGER_STDERR:"):].split()[0]
             sys.stderr.write(f"DEBUG_LOG: {msg}\n")
             sys.stderr.flush()
 
-        # 2. Trigger unknown ID injection
         if "TRIGGER_UNKNOWN_ID:" in decoded_payload:
             idx = decoded_payload.find("TRIGGER_UNKNOWN_ID:")
             ghost_id = decoded_payload[idx + len("TRIGGER_UNKNOWN_ID:"):].split()[0]
             sys.stdout.write(f"ACK {ghost_id}\n")
             sys.stdout.flush()
 
-        # 3. Trigger malformed response
         if "TRIGGER_MALFORMED" in decoded_payload:
             sys.stdout.write("CORRUPTED_LINE_NOT_A_VALID_ACK_OR_ERR\n")
             sys.stdout.flush()
 
-        # 4. Trigger delay (testing timeout)
         if "TRIGGER_DELAY:" in decoded_payload:
             idx = decoded_payload.find("TRIGGER_DELAY:")
             sec = float(decoded_payload[idx + len("TRIGGER_DELAY:"):].split()[0])
             time.sleep(sec)
 
-        # 5. Trigger abrupt crash (testing child crash / unexpected EOF)
         if "TRIGGER_CRASH" in decoded_payload:
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(137)
 
-        # 6. Trigger explicit ERR response
         if "TRIGGER_ERR:" in decoded_payload:
             idx = decoded_payload.find("TRIGGER_ERR:")
             err_msg = decoded_payload[idx + len("TRIGGER_ERR:"):].split()[0]
@@ -118,11 +180,58 @@ def main() -> int:
             sys.stdout.flush()
             continue
 
-        # Standard successful ACK
+        # Normal execution
+        if cmd == "PUT":
+            wal_file.write(json.dumps({"type": "PUT", "k": k, "v": v}) + "\n")
+            wal_file.flush()
+            os.fsync(wal_file.fileno())
+        elif cmd == "DEL":
+            wal_file.write(json.dumps({"type": "DEL", "k": k}) + "\n")
+            wal_file.flush()
+            os.fsync(wal_file.fileno())
+        elif cmd == "BATCH":
+            items = []
+            for item in parts[2:]:
+                if item.startswith("P:"):
+                    subparts = item.split(":")
+                    if len(subparts) == 3:
+                        items.append({"type": "PUT", "k": decode_hex(subparts[1]), "v": decode_hex(subparts[2])})
+                elif item.startswith("D:"):
+                    subparts = item.split(":")
+                    if len(subparts) == 2:
+                        items.append({"type": "DEL", "k": decode_hex(subparts[1])})
+
+            wal_file.write(json.dumps({"type": "BATCH", "items": items}) + "\n")
+            wal_file.flush()
+            os.fsync(wal_file.fileno())
+
+        # Send ACK
         sys.stdout.write(f"ACK {op_id}\n")
         sys.stdout.flush()
 
+    wal_file.close()
     return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        sys.stderr.write(f"Usage: {sys.argv[0]} <serve|open|check|dump> <path>\n")
+        return 1
+
+    subcmd = sys.argv[1].lower()
+    path = sys.argv[2]
+
+    if subcmd == "serve":
+        return do_serve(path)
+    elif subcmd == "open":
+        return do_open(path)
+    elif subcmd == "check":
+        return do_check(path)
+    elif subcmd == "dump":
+        return do_dump(path)
+    else:
+        sys.stderr.write(f"Unknown subcommand '{subcmd}'\n")
+        return 1
 
 
 if __name__ == "__main__":

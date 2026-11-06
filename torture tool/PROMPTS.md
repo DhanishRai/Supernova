@@ -529,3 +529,113 @@ track acknowledged writes
 
 STOP after CP3.
 ```
+
+
+---
+
+### Entry 5
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:12:24 IST
+- **Development Stage**: CP4 (Single-Writer Random-Time Crash Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP4: single-writer random-time crash testing.
+
+Use the existing protocol and oracle.
+
+OBJECTIVE:
+
+For each iteration:
+
+1. Create a fresh database directory.
+2. Start kvdb serve.
+3. Start a writer.
+4. Generate random PUT, DEL, and BATCH operations.
+5. Continuously submit operations.
+6. Record every actual ACK in the oracle.
+7. Choose a random millisecond delay.
+8. Kill the database using SIGKILL.
+9. Stop and join the writer safely.
+10. Preserve all received responses.
+11. Run kvdb open.
+12. Run kvdb check.
+13. Run kvdb dump.
+14. Parse the dump.
+15. Compare recovered state against the independent oracle.
+
+RANDOMNESS:
+
+Use:
+
+rng = random.Random(seed)
+
+Never use the global random module.
+
+All workload generation and random kill delays must use controlled RNG instances.
+
+KILL TIMING:
+
+Example:
+
+delay_ms = rng.randint(1, 100)
+
+The writer must remain active during the kill window.
+
+Do not wait for an operation to finish before killing.
+
+Use proc.kill() on Linux.
+
+Verify the process actually exited because of SIGKILL.
+
+ORACLE VERIFICATION:
+
+- Missing acknowledged operations are failures.
+- Incorrect values are failures.
+- Unknown values are failures.
+- Partial batches are failures.
+- Fully applied unacknowledged operations may be valid.
+- Lost ACKs must not cause false failures.
+
+Respect the documented engine ordering contract.
+
+DUMP VERIFICATION:
+
+Detect malformed dump output.
+
+For mismatches report:
+
+- Key.
+- Expected state.
+- Actual state.
+- Operation IDs.
+- Value lengths.
+- Value hashes.
+
+REPORTING:
+
+Print one line per iteration.
+
+Stop at the first genuine failure.
+
+Preserve failure artifacts.
+
+TEST:
+
+Use fake-process tests where necessary.
+
+Never claim fake-engine tests prove crash consistency.
+
+GIT COMMIT:
+
+add random crash verification
+
+Explain the design and limitations.
+
+STOP after CP4.
+```

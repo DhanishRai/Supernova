@@ -36,6 +36,12 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - **Batch Atomicity Verification**: Collapses repeated sub-operations within batches to verify net all-or-nothing visibility.
   - **Integrity Validation**: Detects alien, corrupted, or unwritten values.
 
+### CP4: Single-Writer Random-Time Crash Testing
+- **`worker.py`**: Workload generator running in a dedicated thread, continuously issuing PUT, DEL, and BATCH operations with controlled pseudorandom seed.
+- **`verifier.py`**: Post-crash verifier executing `open`, `check`, and `dump`, detecting malformed output, and performing deep value hash comparisons against the Oracle.
+- **`reporting.py`**: Console iteration reporting and failure artifact archiving (copies corrupted DB, dumps, and Oracle JSON log into `/tmp/torture_failures/`).
+- **`runner.py`**: Orchestrates the adversarial crash loop, injecting `SIGKILL` at microsecond/millisecond offsets while the writer is active, re-opening, and verifying recovery safety.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

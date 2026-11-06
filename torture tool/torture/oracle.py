@@ -364,33 +364,61 @@ class DatabaseOracle:
                             f"DELETION VIOLATION: Key '{key}' was ACKed as deleted by op '{prov.op_id}', but is still present with value '{actual_dump[key]}'!"
                         )
 
+            # Helper to compute definite state prior to a given operation sequence
+            def get_state_before(target_seq: int) -> Dict[str, str]:
+                st: Dict[str, str] = {}
+                for o in self._history:
+                    if o.seq >= target_seq:
+                        break
+                    if not o.acked:
+                        continue
+                    if o.op_type == OpType.PUT and o.key and o.value:
+                        st[o.key] = o.value
+                    elif o.op_type == OpType.DEL and o.key:
+                        st.pop(o.key, None)
+                    elif o.op_type == OpType.BATCH:
+                        for s in o.batch_items:
+                            if s.op_type == OpType.PUT and s.value:
+                                st[s.key] = s.value
+                            elif s.op_type == OpType.DEL:
+                                st.pop(s.key, None)
+                return st
+
             # 5. Check Batch Atomicity for all batches (ACKed and unACKed)
             for op in self._history:
                 if op.op_type != OpType.BATCH:
                     continue
+
+                state_before = get_state_before(op.seq)
 
                 # Collapse repeated operations within the same batch to the net final sub-op per key
                 net_batch_ops: Dict[str, BatchSubOp] = {}
                 for sub in op.batch_items:
                     net_batch_ops[sub.key] = sub
 
-                # For every distinct key in the batch, determine if its net effect is visible
-                sub_effects = []
+                # Determine visibility for informative operations
+                informative_effects: List[Tuple[str, bool]] = []
                 for sub_key, sub in net_batch_ops.items():
                     if sub.op_type == OpType.PUT:
                         is_vis = (actual_dump.get(sub_key) == sub.value)
-                        sub_effects.append((sub_key, is_vis))
+                        informative_effects.append((sub_key, is_vis))
                     elif sub.op_type == OpType.DEL:
-                        is_vis = (sub_key not in actual_dump)
-                        sub_effects.append((sub_key, is_vis))
+                        # Deleting an already non-existent key is a no-op; only active deletions are informative
+                        if sub_key in state_before:
+                            is_vis = (sub_key not in actual_dump)
+                            informative_effects.append((sub_key, is_vis))
 
-                visible_count = sum(1 for _, vis in sub_effects if vis)
-                total_items = len(sub_effects)
+                if not informative_effects:
+                    # Batch consisted solely of deleting non-existent keys (all no-ops)
+                    continue
+
+                visible_count = sum(1 for _, vis in informative_effects if vis)
+                total_items = len(informative_effects)
 
                 if 0 < visible_count < total_items:
                     # Potential torn batch! Check if the non-visible keys were overwritten by later ops
                     is_torn = False
-                    for sub_k, is_vis in sub_effects:
+                    for sub_k, is_vis in informative_effects:
                         if not is_vis:
                             # If no subsequent op touched this key, then this batch was torn!
                             subsequent_writes = [
@@ -413,6 +441,9 @@ class DatabaseOracle:
                 # Classify unACKed batch status
                 if not op.acked and not op.errored:
                     if visible_count == total_items:
+                        unacked_committed.append(op.op_id)
+                    elif visible_count == 0:
+                        unacked_discarded.append(op.op_id)
                         unacked_committed.append(op.op_id)
                     elif visible_count == 0:
                         unacked_discarded.append(op.op_id)

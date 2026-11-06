@@ -18,6 +18,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from torture.config import parse_args, TortureMode
+from torture.runner import CrashTestRunner
 
 
 def main(args=None) -> int:
@@ -29,21 +30,20 @@ def main(args=None) -> int:
         sys.stderr.write(f"Configuration Error: {exc}\n")
         return 1
 
-    print("=" * 60)
-    print("SUPERNOVA CRASH-CONSISTENCY TORTURE TOOL")
-    print("Stage: CP1 (Project Skeleton & Argument Parsing)")
-    print(f"Mode: {config.mode.value}")
-    print(f"Iterations: {config.iterations}")
-    print(f"Seed: {config.seed} (generated={config.seed_generated})")
-    print(f"Engine Executable: {config.engine_bin}")
-    print(f"Target Database: {config.db_path}")
-    print(f"Independent Oracle: {config.oracle_path}")
-    print(f"Concurrent Writers: {config.workers}")
-    if config.max_bytes:
-        print(f"Simulated Max Disk Bytes: {config.max_bytes}")
-    print("=" * 60)
-    print("CP1 validation successful: Project skeleton and argument parsing operational.")
-    return 0
+    # Check if target engine binary is available
+    if not os.path.exists(config.engine_bin):
+        print("=" * 65)
+        print("SUPERNOVA CRASH-CONSISTENCY TORTURE TOOL")
+        print("Stage: CP4 (Single-Writer Random Crash Testing)")
+        print(f"Mode: {config.mode.value} | Iterations: {config.iterations} | Seed: {config.seed}")
+        print("=" * 65)
+        print(f"NOTICE: Engine executable '{config.engine_bin}' not found.")
+        print("Person A's Go storage engine must be compiled before running live testing.")
+        print("Harness verification is available via unit test suite: python3 -m unittest discover")
+        return 0
+
+    runner = CrashTestRunner(config)
+    return runner.run()
 
 
 if __name__ == "__main__":
