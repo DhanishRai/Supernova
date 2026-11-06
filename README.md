@@ -18,7 +18,7 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 5 complete
+- **Status:** Step 6 complete
 - **Engine Core:**
   - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
@@ -26,15 +26,13 @@ Key guarantees:
   - Binary record decoder (`decodeRecord`) implemented with defensive bounds checking before reading/allocating.
   - In-memory hash index (`Index` backed by `map[string]entry`) implemented with ordered batch application.
   - Database file structure and safe initialization (`Open`, `Close`, `DB` struct) implemented with 16-byte header.
-  - Internal durable record append (`appendRecord`) implemented:
-    - Pre-encodes record in memory before capacity check (`oldSize + recordLen > maxBytes`), returning `ErrDiskFull` without disk writes if limit is reached.
-    - Appends complete record at `oldSize` using `WriteAt`.
-    - Detects write errors and short writes with immediate rollback attempt.
-    - Calls `Sync()` to force durability before advancing `db.size` or returning metadata.
-    - If `WriteAt` or `Sync` fails, executes `rollback(oldSize)` truncating file back to `oldSize` and syncing truncation.
-    - If rollback cannot be confirmed, poisons the database (`unusable = true`), rejecting all future operations.
-    - Leaves in-memory index untouched (returns `indexOps` to caller for subsequent in-memory application).
-  - Comprehensive unit test suite expanded to 41 tests across record serialization, indexing, file lifecycle, and fault-injected storage appending.
+  - Internal durable record append (`appendRecord`) with rollback and poison state handling.
+  - Core operations (`Put`, `Delete`, `Get`) implemented:
+    - **`Put`:** Validates key (1–1024 B) and value (0–1 MB), appends and syncs single-op record, and only updates index after successful sync.
+    - **`Delete`:** Appends and syncs durable tombstone record, then removes key from index.
+    - **`Get`:** Acquires RLock, verifies key presence, uses `ReadAt` at stored absolute offset, returns an independent copy, and cleanly distinguishes empty values from missing keys (`ErrKeyNotFound`).
+    - Full protection against closed or unusable database states.
+  - Comprehensive unit test suite expanded to 51 tests covering record serialization, indexing, file lifecycle, fault injection, and concurrent CRUD operations.
 
 ---
 
@@ -91,9 +89,9 @@ Each operation entry:
 - [x] **Step 3:** In-memory hash index (`Index`, `entry`, ordered batch application).
 - [x] **Step 4:** File header structure (16 bytes), file initialization, header validation, and open/close lifecycle.
 - [x] **Step 5:** Record append, fsync durability, and rollback on failed write.
-- [ ] **Step 6:** Startup recovery scan & index rebuilding.
-- [ ] **Step 7:** Read path (`Get`) using disk offset indexing (`ReadAt`).
-- [ ] **Step 8:** Public API (`Open`, `Put`, `Get`, `Delete`, `Batch`, `Close`) & concurrency with `sync.RWMutex`.
+- [x] **Step 6:** Core operations (`Put`, `Get`, `Delete`) with global synchronization and safe value extraction.
+- [ ] **Step 7:** Atomic multi-operation batch write (`Batch`).
+- [ ] **Step 8:** Startup recovery scan & index rebuilding.
 - [ ] **Step 9:** Crash safety verification, boundary torture testing, and recovery guarantees.
 
 ---

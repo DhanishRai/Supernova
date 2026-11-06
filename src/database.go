@@ -36,6 +36,8 @@ var (
 	ErrDatabaseUnusable = errors.New("database is unusable due to unconfirmed rollback")
 	// ErrDiskFull indicates appending the record would exceed the maximum configured database size.
 	ErrDiskFull = errors.New("database file size limit reached")
+	// ErrKeyNotFound indicates the requested key does not exist in the database.
+	ErrKeyNotFound = errors.New("key not found")
 	// ErrRecordsNotSupported indicates the file contains data beyond the 16-byte header
 	// before recovery scanning has been implemented.
 	ErrRecordsNotSupported = errors.New("database contains records beyond header; recovery not yet implemented")
