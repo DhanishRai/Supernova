@@ -12,7 +12,7 @@ from enum import Enum
 import random
 import threading
 import time
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from torture.config import TortureMode
 from torture.oracle import BatchSubOp, DatabaseOracle, OpType
