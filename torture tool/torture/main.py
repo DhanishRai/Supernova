@@ -5,6 +5,7 @@ CLI entry point for the Supernova Crash-Consistency Torture Tool.
 Usage:
     python3 -m torture.main --iterations 500 --seed 12345
     ./torture/main.py --iterations 100 --seed 999 --mode large-values
+    ./torture/main.py --mode disk-full
 """
 
 import os
@@ -19,19 +20,21 @@ if PARENT_DIR not in sys.path:
 from torture.config import parse_args, TortureMode
 
 
-def main() -> int:
+def main(args=None) -> int:
     try:
-        config = parse_args()
+        config = parse_args(args)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
     except Exception as exc:
         sys.stderr.write(f"Configuration Error: {exc}\n")
         return 1
 
     print("=" * 60)
     print("SUPERNOVA CRASH-CONSISTENCY TORTURE TOOL")
-    print(f"Stage: CP1 (Protocol & Configuration Engine)")
+    print("Stage: CP1 (Project Skeleton & Argument Parsing)")
     print(f"Mode: {config.mode.value}")
     print(f"Iterations: {config.iterations}")
-    print(f"Deterministic Seed: {config.seed}")
+    print(f"Seed: {config.seed} (generated={config.seed_generated})")
     print(f"Engine Executable: {config.engine_bin}")
     print(f"Target Database: {config.db_path}")
     print(f"Independent Oracle: {config.oracle_path}")
@@ -39,7 +42,7 @@ def main() -> int:
     if config.max_bytes:
         print(f"Simulated Max Disk Bytes: {config.max_bytes}")
     print("=" * 60)
-    print("CP1 validation successful: Configuration and Protocol Engine operational.")
+    print("CP1 validation successful: Project skeleton and argument parsing operational.")
     return 0
 
 

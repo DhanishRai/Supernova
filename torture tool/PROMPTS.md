@@ -297,3 +297,136 @@ Explain the protocol design.
 
 STOP after CP2.
 ```
+
+
+---
+
+### Entry 3
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:01:25 IST
+- **Development Stage**: CP1 (Minimum Python Project Skeleton & Argument Parsing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Do not create Python files anywhere else.
+
+We are implementing CP1 of the KILL IT AND PROVE IT torture tool.
+
+OBJECTIVE:
+
+Inspect the repository and create the minimum Python project skeleton.
+
+STEP 1: INSPECT
+
+Check:
+
+1. Current working directory.
+2. Supernova directory location.
+3. Git repository status.
+4. Existing torture tool directory.
+5. Existing ./kvdb executable.
+6. Python version.
+7. Existing CLI implementation.
+8. Existing executable permissions.
+
+Never assume files or commands exist.
+
+STEP 2: CREATE
+
+Inside torture tool/, create only:
+
+torture/
+    __init__.py
+    main.py
+    config.py
+
+Create an executable launcher named:
+
+torture
+
+STEP 3: ARGUMENT PARSING
+
+Implement argparse.
+
+Required arguments:
+
+--iterations
+--seed
+--mode
+
+Supported modes:
+
+default
+large-values
+large-batches
+recovery-crash
+compaction
+disk-full
+
+Defaults:
+
+iterations = 500
+mode = default
+
+If seed is omitted:
+- Generate a seed.
+- Print it clearly.
+- Ensure future workload generation can use it.
+
+Validate invalid arguments.
+
+Do not implement database communication yet.
+
+STEP 4: TEST
+
+Test:
+
+- Default arguments.
+- Custom iterations.
+- Custom seed.
+- All supported modes.
+- Invalid modes.
+- Zero iterations.
+- Negative iterations.
+- Invalid seeds.
+
+Use unittest or direct tests.
+
+STEP 5: REVIEW
+
+Check:
+- Imports.
+- Argument validation.
+- Executable permissions.
+- Folder structure.
+- Accidental modifications outside torture tool/.
+
+STEP 6: GIT COMMIT
+
+Inspect git status and diff.
+
+Stage only my files.
+
+Commit:
+
+add torture tool skeleton
+
+Verify the commit and display its hash.
+
+STEP 7: REPORT
+
+Explain every created file.
+
+Show commands executed and actual test results.
+
+Ask:
+
+"What bug would this check catch, and what bug could slip past it?"
+
+STOP after CP1.
+```
