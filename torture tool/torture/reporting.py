@@ -108,3 +108,4 @@ class Reporter:
         sys.stderr.write(f"\n[CRITICAL FAILURE] Artifacts preserved in: {dest_dir}\n")
         sys.stderr.flush()
         return dest_dir
+

@@ -639,3 +639,84 @@ Explain the design and limitations.
 
 STOP after CP4.
 ```
+
+
+---
+
+### Entry 6
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 15:20:45 IST
+- **Development Stage**: CP4 Sabotage Test (Fault Injection & Torture Tool Verification)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All torture-tool improvements must remain inside:
+
+Supernova/torture tool/
+
+We have completed CP4.
+
+Now perform the CP4 SABOTAGE TEST.
+
+OBJECTIVE:
+
+Prove that our torture tool can detect deliberately introduced engine bugs.
+
+Coordinate with Person A.
+
+Ask Person A to create temporary sabotaged engine versions.
+
+SABOTAGE 1:
+
+Remove the engine's required fsync operation.
+
+SABOTAGE 2:
+
+Send ACK before the operation becomes durable.
+
+IMPORTANT:
+
+Never permanently modify or commit Person A's engine code.
+
+Run the torture tool against each sabotaged version separately.
+
+RECORD:
+
+- Sabotage type.
+- Seed.
+- Iteration.
+- Mode.
+- Expected result.
+- Actual result.
+- Whether the bug was detected.
+- Failure evidence.
+
+IF NOT DETECTED:
+
+Investigate:
+
+1. Did the workload overlap the vulnerable operation?
+2. Did SIGKILL occur during a useful window?
+3. Is the oracle correct?
+4. Is the workload sensitive enough?
+5. Are we accidentally accepting invalid states?
+
+Improve only the torture tool when necessary.
+
+Repeat the experiment.
+
+Do not weaken assertions.
+
+Do not claim success without evidence.
+
+Explain why random crash testing is probabilistic.
+
+Ask Person A for temporary instrumentation around write and fsync operations if useful.
+
+Instrumentation must not replace real SIGKILL testing.
+
+Commit legitimate improvements separately.
+
+STOP after the sabotage report.
+```
