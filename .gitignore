@@ -30,12 +30,13 @@ vendor/
 .DS_Store
 Thumbs.db
 
-# IDE and editors
+# IDE, editors, and agent metadata
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+.agents/
 
 # Local database and temporary files generated during runs/testing
 *.db
@@ -44,3 +45,6 @@ Thumbs.db
 *.kv
 *.kv.tmp
 *.tmp
+
+/src
+src
