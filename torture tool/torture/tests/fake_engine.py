@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional
 
 
 def decode_hex(hex_str: str) -> str:
@@ -125,9 +126,49 @@ def do_dump(db_path: str) -> int:
     return 0
 
 
-def do_serve(db_path: str) -> int:
+def do_serve(db_path: str, max_bytes: Optional[int] = None) -> int:
     wal_path = get_wal_path(db_path)
     wal_file = open(wal_path, "a", encoding="utf-8")
+
+    in_memory_state = {}
+    data_path = get_data_path(db_path)
+    if os.path.exists(data_path):
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                in_memory_state = json.load(f)
+        except Exception:
+            in_memory_state = {}
+    if os.path.exists(wal_path):
+        try:
+            with open(wal_path, "r", encoding="utf-8") as f:
+                for l in f:
+                    l = l.strip()
+                    if not l:
+                        continue
+                    try:
+                        entry = json.loads(l)
+                        etype = entry.get("type")
+                        if etype == "PUT":
+                            in_memory_state[entry["k"]] = entry["v"]
+                        elif etype == "DEL":
+                            in_memory_state.pop(entry["k"], None)
+                        elif etype == "BATCH":
+                            for sub in entry.get("items", []):
+                                if sub["type"] == "PUT":
+                                    in_memory_state[sub["k"]] = sub["v"]
+                                elif sub["type"] == "DEL":
+                                    in_memory_state.pop(sub["k"], None)
+                    except Exception:
+                        break
+        except Exception:
+            pass
+
+    def get_current_storage_size() -> int:
+        wal_file.flush()
+        w_size = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+        d_path = get_data_path(db_path)
+        d_size = os.path.getsize(d_path) if os.path.exists(d_path) else 0
+        return w_size + d_size
 
     while True:
         try:
@@ -206,13 +247,34 @@ def do_serve(db_path: str) -> int:
 
         # Normal execution
         if cmd == "PUT":
-            wal_file.write(json.dumps({"type": "PUT", "k": k, "v": v}) + "\n")
+            payload_str = json.dumps({"type": "PUT", "k": k, "v": v}) + "\n"
+            if max_bytes is not None and (get_current_storage_size() + len(payload_str.encode("utf-8")) > max_bytes):
+                sys.stdout.write(f"ERR {op_id} disk full (exceeded max-bytes limit of {max_bytes} bytes)\n")
+                sys.stdout.flush()
+                continue
+            wal_file.write(payload_str)
             wal_file.flush()
             os.fsync(wal_file.fileno())
+            in_memory_state[k] = v
         elif cmd == "DEL":
-            wal_file.write(json.dumps({"type": "DEL", "k": k}) + "\n")
+            payload_str = json.dumps({"type": "DEL", "k": k}) + "\n"
+            if max_bytes is not None and (get_current_storage_size() + len(payload_str.encode("utf-8")) > max_bytes):
+                sys.stdout.write(f"ERR {op_id} disk full (exceeded max-bytes limit of {max_bytes} bytes)\n")
+                sys.stdout.flush()
+                continue
+            wal_file.write(payload_str)
             wal_file.flush()
             os.fsync(wal_file.fileno())
+            in_memory_state.pop(k, None)
+        elif cmd == "GET":
+            target_key = decode_hex(parts[2]) if len(parts) > 2 else ""
+            if target_key in in_memory_state:
+                val_hex = in_memory_state[target_key].encode("utf-8").hex()
+                sys.stdout.write(f"ACK {op_id} {val_hex}\n")
+            else:
+                sys.stdout.write(f"ERR {op_id} key not found\n")
+            sys.stdout.flush()
+            continue
         elif cmd == "BATCH":
             items = []
             for item in parts[2:]:
@@ -229,9 +291,21 @@ def do_serve(db_path: str) -> int:
                 # Deliberate sabotage: persist only the first half of batch items
                 items = items[: len(items) // 2]
 
-            wal_file.write(json.dumps({"type": "BATCH", "items": items}) + "\n")
+            payload_str = json.dumps({"type": "BATCH", "items": items}) + "\n"
+            if max_bytes is not None and (get_current_storage_size() + len(payload_str.encode("utf-8")) > max_bytes):
+                # Critical: Atomically reject the entire batch! None of the items are applied.
+                sys.stdout.write(f"ERR {op_id} disk full (exceeded max-bytes limit of {max_bytes} bytes)\n")
+                sys.stdout.flush()
+                continue
+
+            wal_file.write(payload_str)
             wal_file.flush()
             os.fsync(wal_file.fileno())
+            for sub in items:
+                if sub["type"] == "PUT":
+                    in_memory_state[sub["k"]] = sub["v"]
+                elif sub["type"] == "DEL":
+                    in_memory_state.pop(sub["k"], None)
 
             if "TRIGGER_CRASH_AFTER_SYNC" in raw_line:
                 wal_file.close()
@@ -308,14 +382,22 @@ def do_serve(db_path: str) -> int:
 
 def main() -> int:
     if len(sys.argv) < 3:
-        sys.stderr.write(f"Usage: {sys.argv[0]} <serve|open|check|dump> <path>\n")
+        sys.stderr.write(f"Usage: {sys.argv[0]} <serve|open|check|dump> <path> [--max-bytes <bytes>]\n")
         return 1
 
     subcmd = sys.argv[1].lower()
     path = sys.argv[2]
+    max_bytes = None
+    if "--max-bytes" in sys.argv:
+        idx = sys.argv.index("--max-bytes")
+        if idx + 1 < len(sys.argv):
+            try:
+                max_bytes = int(sys.argv[idx + 1])
+            except ValueError:
+                pass
 
     if subcmd == "serve":
-        return do_serve(path)
+        return do_serve(path, max_bytes=max_bytes)
     elif subcmd == "open":
         return do_open(path)
     elif subcmd == "check":

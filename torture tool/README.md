@@ -154,6 +154,33 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - Tests repeated multi-iteration compaction crashes.
   - Tests defect detection on sabotaged compaction engines.
 
+### CP11: Disk-Full Mode (`--mode disk-full`)
+- **Disk-Full Emulation & Crash Testing Workflow**:
+  1. Spawns engine in `serve` mode with a deliberately constrained maximum size limit: `./kvdb serve <path> --max-bytes <bytes>` (defaults to 100,000 bytes).
+  2. Maintains independent Oracle ground-truth state model.
+  3. Executes sequence of successful writes (small PUT, DEL, BATCH) within size budget and verifies `ACK` durability.
+  4. Issues single PUT exceeding `max-bytes` limit:
+     - Verifies engine returns a clean, structured error response: `ERR <op_id> <message>`.
+     - Validates engine does not panic, crash, or enter corrupted state.
+     - Records error status in Oracle.
+  5. Issues multi-item BATCH exceeding `max-bytes` limit:
+     - Verifies engine returns clean `ERR <op_id> <message>`.
+     - Enforces strict **Atomic Batch Rejection**: if any item or cumulative batch size exceeds limit, zero items may be persisted. Partial batch application is strictly prohibited.
+  6. Verifies existing acknowledged data remains readable and intact before kill.
+  7. Injects `SIGKILL` directly into engine process following disk-full errors.
+  8. Restarts engine and initiates recovery via `kvdb open`.
+  9. Evaluates recovered state against Oracle via `kvdb check` and `kvdb dump`:
+     - All acknowledged operations prior to disk-full errors remain intact and uncorrupted.
+     - Rejected operations (PUT and BATCH) are 100% absent from recovered storage.
+     - Zero data corruption, zero torn batches.
+- **`tests/test_disk_full.py`**:
+  - Tests successful pre-limit writes and post-limit clean ERR responses.
+  - Tests atomic batch rejection under disk-full (no partial writes).
+  - Tests existing data readability before process termination.
+  - Tests post-crash recovery and Oracle state verification.
+  - Tests full `CrashTestRunner` execution in `disk-full` mode.
+  - Tests defect detection against sabotaged engines that partially persist errored batches or corrupt acknowledged records.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

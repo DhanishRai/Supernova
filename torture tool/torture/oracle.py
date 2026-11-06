@@ -365,6 +365,8 @@ class DatabaseOracle:
             # 1. Collect all valid historical values ever written per key
             historical_values_per_key: Dict[str, Set[str]] = {}
             for op in self._history:
+                if op.errored:
+                    continue
                 if op.op_type == OpType.PUT and op.key and op.value:
                     historical_values_per_key.setdefault(op.key, set()).add(op.value)
                 elif op.op_type == OpType.BATCH:
@@ -580,9 +582,6 @@ class DatabaseOracle:
                 # Classify unACKed batch status
                 if not op.acked and not op.errored:
                     if visible_count == total_items:
-                        unacked_committed.append(op.op_id)
-                    elif visible_count == 0:
-                        unacked_discarded.append(op.op_id)
                         unacked_committed.append(op.op_id)
                     elif visible_count == 0:
                         unacked_discarded.append(op.op_id)

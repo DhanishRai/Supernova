@@ -1126,6 +1126,63 @@ test compaction crashes
 STOP after CP10.
 ```
 
+---
+
+### Entry 13
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 16:47:24 IST
+- **Development Stage**: CP11 (Disk-Full Mode Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP11: disk-full mode.
+
+Add:
+
+--mode disk-full
+
+Start the engine with a deliberately small maximum size.
+
+Example:
+
+./kvdb serve <path> --max-bytes 100000
+
+TEST:
+
+1. Successful writes before reaching the limit.
+2. PUT exceeding the limit.
+3. BATCH exceeding the limit.
+4. Clean ERR responses.
+5. Existing data remains readable.
+6. Kill after disk-full errors.
+7. Restart and recover.
+8. Verify acknowledged data.
+
+CRITICAL:
+
+A failed batch must not be partially applied.
+
+An ERR response alone does not prove correctness.
+
+Always inspect recovered state against the independent oracle.
+
+Verify disk-full errors do not corrupt acknowledged data.
+
+Inspect actual CLI error semantics.
+
+GIT COMMIT:
+
+test disk full errors
+
+STOP after CP11.
+```
+
+
 
 
 

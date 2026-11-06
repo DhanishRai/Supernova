@@ -168,7 +168,7 @@ class ProtocolCodec:
     """Encodes commands and parses responses according to the agreed wire protocol."""
 
     # Regex for responses
-    ACK_RE = re.compile(r"^ACK\s+(\S+)\s*$")
+    ACK_RE = re.compile(r"^ACK\s+(\S+)(?:\s+(.*))?$")
     ERR_RE = re.compile(r"^ERR\s+(\S+)(?:\s+(.*))?$")
 
     @staticmethod
@@ -178,6 +178,10 @@ class ProtocolCodec:
     @staticmethod
     def encode_del(op_id: str, key: Union[str, bytes]) -> str:
         return f"DEL {op_id} {to_hex(key)}\n"
+
+    @staticmethod
+    def encode_get(op_id: str, key: Union[str, bytes]) -> str:
+        return f"GET {op_id} {to_hex(key)}\n"
 
     @staticmethod
     def encode_batch(op_id: str, items: Iterable[BatchItem]) -> str:
@@ -205,7 +209,9 @@ class ProtocolCodec:
 
         ack_match = cls.ACK_RE.match(cleaned)
         if ack_match:
-            return ProtocolResponse(status="ACK", op_id=ack_match.group(1)), False
+            op_id = ack_match.group(1)
+            msg = ack_match.group(2) if ack_match.group(2) else None
+            return ProtocolResponse(status="ACK", op_id=op_id, message=msg), False
 
         err_match = cls.ERR_RE.match(cleaned)
         if err_match:
@@ -231,10 +237,12 @@ class EngineClient:
         db_path: str,
         id_generator: Optional[IdGenerator] = None,
         default_timeout: float = 5.0,
+        max_bytes: Optional[int] = None,
     ) -> None:
         self.engine_bin = engine_bin
         self.db_path = db_path
         self.default_timeout = default_timeout
+        self.max_bytes = max_bytes
         self.id_gen = id_generator or IdGenerator()
 
         self._proc: Optional[subprocess.Popen] = None
@@ -273,6 +281,8 @@ class EngineClient:
             raise EngineProcessError("Engine process is already running")
 
         cmd = [self.engine_bin, "serve", self.db_path]
+        if self.max_bytes is not None:
+            cmd.extend(["--max-bytes", str(self.max_bytes)])
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -444,6 +454,17 @@ class EngineClient:
         """Submits a DEL operation."""
         chosen_id = op_id or self.id_gen.next_id()
         cmd = ProtocolCodec.encode_del(chosen_id, key)
+        return self._send_command(chosen_id, cmd, timeout=timeout)
+
+    def get(
+        self,
+        key: Union[str, bytes],
+        op_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ProtocolResponse:
+        """Submits a GET operation."""
+        chosen_id = op_id or self.id_gen.next_id()
+        cmd = ProtocolCodec.encode_get(chosen_id, key)
         return self._send_command(chosen_id, cmd, timeout=timeout)
 
     def batch(

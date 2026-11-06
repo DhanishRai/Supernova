@@ -119,6 +119,19 @@ class CompactionCrashInfo:
 
 
 @dataclass
+class DiskFullCrashInfo:
+    """Detailed telemetry for disk-full crash executions (CP11)."""
+    max_bytes: int
+    successful_writes: int
+    failed_puts: int
+    failed_batches: int
+    clean_err_count: int
+    data_readable_before_kill: bool
+    recovery_succeeded: bool
+    recovered_keys: int
+
+
+@dataclass
 class FailureDetails:
     """Comprehensive failure context required for professional reporting."""
     category: FailureCategory
@@ -136,6 +149,7 @@ class FailureDetails:
     operation_types: List[str] = field(default_factory=list)
     recovery_info: Optional[RecoveryCrashInfo] = None
     compaction_info: Optional[CompactionCrashInfo] = None
+    disk_full_info: Optional[DiskFullCrashInfo] = None
 
 
 def classify_failure(
@@ -225,6 +239,7 @@ class IterationReport:
     missed_crash_window: bool = False
     recovery_info: Optional[RecoveryCrashInfo] = None
     compaction_info: Optional[CompactionCrashInfo] = None
+    disk_full_info: Optional[DiskFullCrashInfo] = None
 
 
 class Reporter:
@@ -261,6 +276,18 @@ class Reporter:
                     f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
                     f"delay={rep.delay_ms:02d}ms "
                     f"compact={compact_str} "
+                    f"keys={rep.recovered_keys:03d} "
+                    f"({rep.duration_s:.3f}s)"
+                )
+            elif rep.mode == "disk-full":
+                errs_str = f"errs={rep.disk_full_info.clean_err_count}" if rep.disk_full_info else "errs=0"
+                limit_str = f"limit={rep.disk_full_info.max_bytes}B" if rep.disk_full_info else ""
+                line = (
+                    f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
+                    f"delay={rep.delay_ms:02d}ms "
+                    f"writes={rep.acked:03d} "
+                    f"{errs_str} "
+                    f"{limit_str} "
                     f"keys={rep.recovered_keys:03d} "
                     f"({rep.duration_s:.3f}s)"
                 )
@@ -479,6 +506,16 @@ class Reporter:
                 "actual_process_exit_status": details.compaction_info.actual_exit_status,
                 "temp_files_found": details.compaction_info.temp_files_found,
             } if details.compaction_info else None,
+            "disk_full_crash_info": {
+                "max_bytes": details.disk_full_info.max_bytes,
+                "successful_writes": details.disk_full_info.successful_writes,
+                "failed_puts": details.disk_full_info.failed_puts,
+                "failed_batches": details.disk_full_info.failed_batches,
+                "clean_err_count": details.disk_full_info.clean_err_count,
+                "data_readable_before_kill": details.disk_full_info.data_readable_before_kill,
+                "recovery_succeeded": details.disk_full_info.recovery_succeeded,
+                "recovered_keys": details.disk_full_info.recovered_keys,
+            } if details.disk_full_info else None,
             "reproducibility_notice": REPRODUCIBILITY_NOTICE,
         }
         report_json_file = os.path.join(dest_dir, "failure_report.json")
@@ -520,6 +557,17 @@ class Reporter:
                 f.write(f"Requested Kill Delay       : {details.compaction_info.requested_kill_delay_ms:.2f} ms\n")
                 f.write(f"Actual Process Exit Status : {details.compaction_info.actual_exit_status}\n")
                 f.write(f"Temp Files Found on Disk   : {details.compaction_info.temp_files_found}\n\n")
+
+            if details.disk_full_info:
+                f.write("--- DISK-FULL LIMIT TELEMETRY ---\n")
+                f.write(f"Configured Max Bytes       : {details.disk_full_info.max_bytes}\n")
+                f.write(f"Successful Pre-Limit Writes: {details.disk_full_info.successful_writes}\n")
+                f.write(f"Failed Over-Limit PUTs     : {details.disk_full_info.failed_puts}\n")
+                f.write(f"Failed Over-Limit BATCHes  : {details.disk_full_info.failed_batches}\n")
+                f.write(f"Clean ERR Responses        : {details.disk_full_info.clean_err_count}\n")
+                f.write(f"Data Readable Before Kill  : {details.disk_full_info.data_readable_before_kill}\n")
+                f.write(f"Post-Crash Recovery OK     : {details.disk_full_info.recovery_succeeded}\n")
+                f.write(f"Recovered Keys Count       : {details.disk_full_info.recovered_keys}\n\n")
 
             f.write("--- CHILD PROCESS EXIT INFORMATION ---\n")
             if details.child_exit:

@@ -187,16 +187,21 @@ def parse_args(args: Optional[List[str]] = None, print_generated_seed: bool = Tr
             sys.stdout.write(f"[torture] No seed provided. Generated deterministic seed: {chosen_seed}\n")
             sys.stdout.flush()
 
+    effective_mode = TortureMode(parsed.mode)
+    effective_max_bytes = parsed.max_bytes
+    if effective_mode == TortureMode.DISK_FULL and effective_max_bytes is None:
+        effective_max_bytes = 100_000
+
     config = TortureConfig(
         iterations=parsed.iterations,
         seed=chosen_seed,
-        mode=TortureMode(parsed.mode),
+        mode=effective_mode,
         seed_generated=seed_generated,
         engine_bin=parsed.engine_bin,
         db_path=parsed.db_path,
         oracle_path=parsed.oracle_path,
         workers=parsed.workers,
-        max_bytes=parsed.max_bytes,
+        max_bytes=effective_max_bytes,
         min_kill_delay_ms=parsed.min_kill_delay_ms,
         max_kill_delay_ms=parsed.max_kill_delay_ms,
         artifacts_dir=parsed.artifacts_dir,
