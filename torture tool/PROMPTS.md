@@ -1070,6 +1070,63 @@ test recovery crashes
 STOP after CP9.
 ```
 
+---
+
+### Entry 12
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 16:38:50 IST
+- **Development Stage**: CP10 (Compaction-Crash Mode Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP10: compaction-crash mode.
+
+Add:
+
+--mode compaction
+
+WORKFLOW:
+
+1. Create a database with meaningful data.
+2. Maintain the independent oracle.
+3. Trigger COMPACT.
+4. Wait for a random millisecond delay.
+5. Kill the engine using SIGKILL.
+6. Restart the engine.
+7. Run open.
+8. Run check.
+9. Run dump.
+10. Compare recovered state against the oracle.
+
+VERIFY:
+
+- Acknowledged data is preserved.
+- No unknown values appear.
+- Old/new file swapping is safe.
+- Temporary files do not become authoritative incorrectly.
+- Recovery succeeds after compaction interruption.
+
+IMPORTANT:
+
+Inspect actual COMPACT ACK semantics.
+
+Do not assume compaction succeeded merely because the request was transmitted.
+
+Test multiple crash windows.
+
+GIT COMMIT:
+
+test compaction crashes
+
+STOP after CP10.
+```
+
+
 
 
 

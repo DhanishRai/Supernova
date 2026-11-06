@@ -36,6 +36,15 @@ def get_data_path(db_path: str) -> str:
 
 def do_open(db_path: str) -> int:
     """Recovers database by replaying WAL into data file."""
+    # Clean up orphan temporary compaction files left from interrupted compactions
+    data = get_data_path(db_path)
+    tmp_compact = data + ".compact.tmp"
+    if os.path.exists(tmp_compact):
+        try:
+            os.remove(tmp_compact)
+        except OSError:
+            pass
+
     # Support simulated recovery window duration for recovery-crash testing
     delay_ms_str = os.environ.get("SUPERNOVA_RECOVERY_DELAY_MS")
     if delay_ms_str:
@@ -229,6 +238,65 @@ def do_serve(db_path: str) -> int:
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(137)
+        elif cmd == "COMPACT":
+            data_path = get_data_path(db_path)
+            tmp_data_path = data_path + ".compact.tmp"
+
+            compaction_state = {}
+            if os.path.exists(data_path):
+                try:
+                    with open(data_path, "r", encoding="utf-8") as f:
+                        compaction_state = json.load(f)
+                except Exception:
+                    compaction_state = {}
+
+            wal_file.flush()
+            if os.path.exists(wal_path):
+                try:
+                    with open(wal_path, "r", encoding="utf-8") as f:
+                        for l in f:
+                            l = l.strip()
+                            if not l:
+                                continue
+                            try:
+                                entry = json.loads(l)
+                                etype = entry.get("type")
+                                if etype == "PUT":
+                                    compaction_state[entry["k"]] = entry["v"]
+                                elif etype == "DEL":
+                                    compaction_state.pop(entry["k"], None)
+                                elif etype == "BATCH":
+                                    for sub in entry.get("items", []):
+                                        if sub["type"] == "PUT":
+                                            compaction_state[sub["k"]] = sub["v"]
+                                        elif sub["type"] == "DEL":
+                                            compaction_state.pop(sub["k"], None)
+                            except Exception:
+                                break
+                except Exception:
+                    pass
+
+            # Write to temporary file first
+            with open(tmp_data_path, "w", encoding="utf-8") as tf:
+                json.dump(compaction_state, tf)
+                tf.flush()
+                os.fsync(tf.fileno())
+
+            # Simulated compaction duration window
+            delay_env = os.environ.get("SUPERNOVA_COMPACTION_DELAY_MS", "30")
+            try:
+                time.sleep(float(delay_env) / 1000.0)
+            except ValueError:
+                pass
+
+            # Atomic swap to authoritative state
+            os.replace(tmp_data_path, data_path)
+
+            # Truncate compacted WAL log
+            wal_file.close()
+            wal_file = open(wal_path, "w", encoding="utf-8")
+            wal_file.flush()
+            os.fsync(wal_file.fileno())
 
         # Send ACK
         sys.stdout.write(f"ACK {op_id}\n")

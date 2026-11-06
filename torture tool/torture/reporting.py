@@ -109,6 +109,16 @@ class RecoveryCrashInfo:
 
 
 @dataclass
+class CompactionCrashInfo:
+    """Detailed telemetry for compaction-crash executions (CP10)."""
+    compact_op_id: str
+    compact_acked: bool
+    requested_kill_delay_ms: float
+    actual_exit_status: Optional[int]
+    temp_files_found: List[str] = field(default_factory=list)
+
+
+@dataclass
 class FailureDetails:
     """Comprehensive failure context required for professional reporting."""
     category: FailureCategory
@@ -125,6 +135,7 @@ class FailureDetails:
     operation_ids: List[str] = field(default_factory=list)
     operation_types: List[str] = field(default_factory=list)
     recovery_info: Optional[RecoveryCrashInfo] = None
+    compaction_info: Optional[CompactionCrashInfo] = None
 
 
 def classify_failure(
@@ -213,6 +224,7 @@ class IterationReport:
     mode: str = "default"
     missed_crash_window: bool = False
     recovery_info: Optional[RecoveryCrashInfo] = None
+    compaction_info: Optional[CompactionCrashInfo] = None
 
 
 class Reporter:
@@ -240,6 +252,15 @@ class Reporter:
                     f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
                     f"delay={rep.delay_ms:02d}ms "
                     f"(recovery interrupted by SIGKILL; 2nd open OK) "
+                    f"keys={rep.recovered_keys:03d} "
+                    f"({rep.duration_s:.3f}s)"
+                )
+            elif rep.mode == "compaction":
+                compact_str = "ACKED" if (rep.compaction_info and rep.compaction_info.compact_acked) else "INTERRUPTED"
+                line = (
+                    f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
+                    f"delay={rep.delay_ms:02d}ms "
+                    f"compact={compact_str} "
                     f"keys={rep.recovered_keys:03d} "
                     f"({rep.duration_s:.3f}s)"
                 )
@@ -451,6 +472,13 @@ class Reporter:
                 "second_recovery_success": details.recovery_info.second_recovery_success,
                 "second_recovery_time_s": details.recovery_info.second_recovery_time_s,
             } if details.recovery_info else None,
+            "compaction_crash_info": {
+                "compact_op_id": details.compaction_info.compact_op_id,
+                "compact_acked": details.compaction_info.compact_acked,
+                "requested_kill_delay_ms": details.compaction_info.requested_kill_delay_ms,
+                "actual_process_exit_status": details.compaction_info.actual_exit_status,
+                "temp_files_found": details.compaction_info.temp_files_found,
+            } if details.compaction_info else None,
             "reproducibility_notice": REPRODUCIBILITY_NOTICE,
         }
         report_json_file = os.path.join(dest_dir, "failure_report.json")
@@ -484,6 +512,14 @@ class Reporter:
                 if details.recovery_info.second_recovery_time_s is not None:
                     f.write(f"Second Recovery Duration   : {details.recovery_info.second_recovery_time_s:.4f} s\n")
                 f.write("\n")
+
+            if details.compaction_info:
+                f.write("--- COMPACTION-CRASH INTERRUPT TELEMETRY ---\n")
+                f.write(f"Compact Op ID              : {details.compaction_info.compact_op_id}\n")
+                f.write(f"Compaction Acknowledged    : {details.compaction_info.compact_acked}\n")
+                f.write(f"Requested Kill Delay       : {details.compaction_info.requested_kill_delay_ms:.2f} ms\n")
+                f.write(f"Actual Process Exit Status : {details.compaction_info.actual_exit_status}\n")
+                f.write(f"Temp Files Found on Disk   : {details.compaction_info.temp_files_found}\n\n")
 
             f.write("--- CHILD PROCESS EXIT INFORMATION ---\n")
             if details.child_exit:

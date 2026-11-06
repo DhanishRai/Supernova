@@ -19,6 +19,7 @@ import random
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from typing import List, Optional
@@ -28,6 +29,7 @@ from torture.oracle import BatchSubOp, DatabaseOracle, OpType
 from torture.protocol import BatchItem, EngineClient
 from torture.reporting import (
     ChildProcessExitInfo,
+    CompactionCrashInfo,
     FailureCategory,
     FailureDetails,
     IterationReport,
@@ -339,6 +341,237 @@ class CrashTestRunner:
         print("=" * 65)
         return 0 if passed_count >= target_successes else 1
 
+    def _run_compaction_crash_loop(self) -> int:
+        """
+        CP10 Compaction-Crash Testing Loop.
+        
+        Workflow:
+        1. Create a database with meaningful data (repeated writes and deletes).
+        2. Maintain the independent oracle.
+        3. Trigger COMPACT.
+        4. Wait for a random millisecond delay.
+        5. Kill the engine using SIGKILL.
+        6. Restart the engine / run open, check, dump.
+        7. Compare recovered state against the oracle.
+        8. Verify:
+           - Acknowledged data is preserved.
+           - No unknown values appear.
+           - Old/new file swapping is safe.
+           - Temporary files do not become authoritative incorrectly.
+           - Recovery succeeds after compaction interruption.
+        """
+        passed_count = 0
+
+        for iter_num in range(1, self.config.iterations + 1):
+            t_start = time.time()
+            iter_seed = self.master_rng.randint(1, 100_000_000)
+            iter_rng = random.Random(iter_seed)
+
+            db_path = self.config.db_path
+            oracle = DatabaseOracle()
+            client: Optional[EngineClient] = None
+            compact_thread: Optional[threading.Thread] = None
+
+            try:
+                # 1. Fresh database path
+                self._clean_db(db_path)
+
+                # 2. Start engine in serve mode
+                client = EngineClient(
+                    engine_bin=self.config.engine_bin,
+                    db_path=db_path,
+                    default_timeout=5.0,
+                )
+                try:
+                    client.start()
+                except Exception as exc:
+                    child_exit = ChildProcessExitInfo.from_client(client) if client else None
+                    details = FailureDetails(
+                        category=FailureCategory.ENGINE_FAILURE,
+                        iteration=iter_num,
+                        total_iterations=self.config.iterations,
+                        seed=self.config.seed,
+                        derived_seed=iter_seed,
+                        mode=self.config.mode.value,
+                        db_path=db_path,
+                        errors=[f"Failed to start engine in serve mode: {exc}"],
+                        child_exit=child_exit,
+                        stderr_lines=list(client.stderr_lines) if client else [],
+                    )
+                    art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
+                    sys.stderr.write(f"\n[FAIL] Iteration {iter_num}: Failed to start engine: {exc}\n")
+                    sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
+                    return 1
+
+                # 3. Create database with meaningful data (overwrites, deletes, batches)
+                num_ops = 50
+                key_pool = [f"key_{i:04d}" for i in range(1, 15)]
+                for op_idx in range(1, num_ops + 1):
+                    op_id = f"cmp-seed-{op_idx}"
+                    coin = iter_rng.random()
+                    k = iter_rng.choice(key_pool)
+                    if coin < 0.6:
+                        # PUT (many repeated overwrites)
+                        v = f"cmp_val_{op_idx}_{iter_rng.randint(1000, 9999)}"
+                        oracle.record_put(op_id, k, v, writer_id="cmp-seeder")
+                        client.put(k, v, op_id=op_id)
+                    elif coin < 0.8:
+                        # DEL (tombstones for compaction to prune)
+                        oracle.record_del(op_id, k, writer_id="cmp-seeder")
+                        client.delete(k, op_id=op_id)
+                    else:
+                        # BATCH
+                        sub_k1 = iter_rng.choice(key_pool)
+                        sub_v1 = f"cmp_val_{op_idx}_b_{iter_rng.randint(1000, 9999)}"
+                        sub_k2 = iter_rng.choice(key_pool)
+                        batch_items = [
+                            BatchItem.make_put(sub_k1, sub_v1),
+                            BatchItem.make_del(sub_k2),
+                        ]
+                        oracle.record_batch(
+                            op_id,
+                            [
+                                BatchSubOp(op_type=OpType.PUT, key=sub_k1, value=sub_v1),
+                                BatchSubOp(op_type=OpType.DEL, key=sub_k2),
+                            ],
+                            writer_id="cmp-seeder",
+                        )
+                        client.batch(batch_items, op_id=op_id)
+
+                # 4. Trigger COMPACT in a background thread to allow interruption
+                compact_op_id = f"compact-{iter_num}"
+                compact_status = {"acked": False, "error": None}
+
+                def send_compact():
+                    try:
+                        resp = client.compact(op_id=compact_op_id, timeout=10.0)
+                        if resp and resp.is_ack:
+                            compact_status["acked"] = True
+                    except Exception as e:
+                        compact_status["error"] = e
+
+                compact_thread = threading.Thread(target=send_compact, name=f"Compactor-{iter_num}")
+                compact_thread.start()
+
+                # 5. Wait for a random millisecond delay
+                delay_ms = iter_rng.uniform(
+                    self.config.min_kill_delay_ms,
+                    self.config.max_kill_delay_ms,
+                )
+                time.sleep(delay_ms / 1000.0)
+
+                # 6. Kill engine using SIGKILL at random instant
+                kill_ret = client.kill(signal.SIGKILL)
+                compact_thread.join(timeout=1.0)
+                client.close()
+                compact_acked = compact_status["acked"]
+
+                child_exit = ChildProcessExitInfo.from_client(client, kill_ret)
+
+                # 7. Check for temporary compaction files on disk before recovery
+                parent_dir = os.path.dirname(os.path.abspath(db_path))
+                base_name = os.path.basename(db_path)
+                temp_files_found = []
+                if os.path.exists(parent_dir):
+                    for fname in os.listdir(parent_dir):
+                        if (fname.endswith(".tmp") or ".compact." in fname) and fname.startswith(base_name):
+                            temp_files_found.append(fname)
+
+                # 8. Post-crash recovery, check, dump, and Oracle verification
+                verifier = StateVerifier(
+                    engine_bin=self.config.engine_bin,
+                    db_path=db_path,
+                    timeout=5.0,
+                )
+                passed, violations, actual_dump = verifier.verify(oracle)
+
+                t_duration = time.time() - t_start
+
+                cmp_info = CompactionCrashInfo(
+                    compact_op_id=compact_op_id,
+                    compact_acked=compact_acked,
+                    requested_kill_delay_ms=delay_ms,
+                    actual_exit_status=child_exit.returncode,
+                    temp_files_found=temp_files_found,
+                )
+
+                rep = IterationReport(
+                    iteration=iter_num,
+                    total_iterations=self.config.iterations,
+                    passed=passed,
+                    delay_ms=int(delay_ms),
+                    submitted=num_ops,
+                    acked=num_ops,
+                    recovered_keys=len(actual_dump),
+                    duration_s=t_duration,
+                    violations=violations,
+                    mode="compaction",
+                    compaction_info=cmp_info,
+                )
+                self.reporter.print_iteration_summary(rep)
+
+                if not rep.passed:
+                    cat = classify_failure(
+                        errors=violations,
+                        child_exit=child_exit,
+                        tool_crashed=False,
+                    )
+                    details = FailureDetails(
+                        category=cat,
+                        iteration=iter_num,
+                        total_iterations=self.config.iterations,
+                        seed=self.config.seed,
+                        derived_seed=iter_seed,
+                        mode=self.config.mode.value,
+                        db_path=db_path,
+                        errors=violations,
+                        child_exit=child_exit,
+                        actual_dump=actual_dump,
+                        operation_ids=[op.op_id for op in oracle.history],
+                        operation_types=sorted(list(set(op.op_type.value for op in oracle.history))),
+                        compaction_info=cmp_info,
+                    )
+                    art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
+                    print("=" * 65)
+                    print(f"FAILED AT COMPACTION-CRASH ITERATION {iter_num} (SEED: {iter_seed}) - [{cat.value}]")
+                    print(f"Artifacts preserved in: {art_dir}")
+                    print("=" * 65)
+                    return 1
+
+                passed_count += 1
+
+            except Exception as exc:
+                tb = traceback.format_exc()
+                details = FailureDetails(
+                    category=FailureCategory.TORTURE_TOOL_FAILURE,
+                    iteration=iter_num,
+                    total_iterations=self.config.iterations,
+                    seed=self.config.seed,
+                    derived_seed=iter_seed,
+                    mode=self.config.mode.value,
+                    db_path=db_path,
+                    errors=[f"Torture tool unexpected internal exception in compaction-crash: {exc}\n{tb}"],
+                )
+                art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
+                sys.stderr.write(f"\n[CRASH] Compaction-crash internal harness failure: {exc}\n")
+                sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
+                return 1
+
+            finally:
+                if client and client.is_alive:
+                    try:
+                        client.kill(signal.SIGKILL)
+                        client.close()
+                    except Exception:
+                        pass
+                if compact_thread and compact_thread.is_alive():
+                    compact_thread.join(timeout=0.5)
+
+        print("=" * 65)
+        print(f"ALL {passed_count} COMPACTION-CRASH ITERATIONS PASSED CRASH CONSISTENCY VERIFICATION!")
+        print("=" * 65)
+        return 0
+
     def run(self) -> int:
         """
         Runs the full iteration loop.
@@ -355,6 +588,8 @@ class CrashTestRunner:
 
         if self.config.mode == TortureMode.RECOVERY_CRASH:
             return self._run_recovery_crash_loop()
+        if self.config.mode == TortureMode.COMPACTION:
+            return self._run_compaction_crash_loop()
 
         passed_count = 0
 

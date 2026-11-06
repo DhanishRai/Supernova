@@ -131,6 +131,29 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - Tests second recovery failure artifact preservation.
   - Tests repeated multi-iteration recovery crash resilience.
 
+### CP10: Compaction-Crash Mode (`--mode compaction`)
+- **Compaction Lifecycle & Crash Testing Workflow**:
+  1. Creates database with meaningful historical operations (repeated overwrites, tombstone deletes, atomic batches).
+  2. Maintains the independent Oracle ground-truth state model.
+  3. Triggers `COMPACT` in a dedicated background thread.
+  4. Waits for a random millisecond delay targeting multiple crash windows:
+     - **Window 1 (Pre-ACK / Mid-Compaction)**: Crash strikes while compaction is writing temporary files or merging entries.
+     - **Window 2 (Post-ACK / Durable)**: Crash strikes after compaction completes and `ACK` is delivered.
+  5. Injects `SIGKILL` directly into the engine process.
+  6. Reopens the database with `kvdb open`, checks with `kvdb check`, and extracts data with `kvdb dump`.
+  7. Verifies recovered dump against Oracle.
+- **Safety & Isolation Invariants**:
+  - **Durability Guarantee**: All acknowledged operations remain 100% durable across compaction crashes.
+  - **No Unknown Values**: No ghost keys or alien values appear.
+  - **Temporary File Isolation**: Uncommitted temporary compaction files (`*.compact.tmp`, `*.tmp`) must **never** become authoritative or corrupt authoritative state.
+  - **Safe Atomic File Swapping**: Verifies atomic rename semantics (`os.replace` / POSIX atomic swap) under sudden power/process death.
+- **`tests/test_compaction.py`**:
+  - Exercises Window 1 (interrupted before ACK).
+  - Exercises Window 2 (crash after ACK).
+  - Verifies temporary file cleanup and isolation.
+  - Tests repeated multi-iteration compaction crashes.
+  - Tests defect detection on sabotaged compaction engines.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash
