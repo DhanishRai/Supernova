@@ -16,6 +16,45 @@ Key guarantees:
 
 ---
 
+## Repository Structure & Team Division
+
+To ensure seamless collaboration when teammates pull or push code, the repository is organized into cleanly separated components:
+
+```
+srinathon-3.0/
+├── cmd/
+│   ├── kvdb/                 # [Teammate 2] CLI, daemon server, compaction trigger
+│   │   └── README.md
+│   └── torture/              # [Teammate 1] Autonomous torture-testing & kill tool
+│       └── README.md
+├── src/                      # [Our Component] Core database engine (package killitdb)
+│   ├── batch.go              # Atomic multi-operation batch writes
+│   ├── database.go           # DB handle, 16-byte header, file lifecycle
+│   ├── index.go              # In-memory hash index (key -> disk offset/len)
+│   ├── operations.go         # Put, Get, Delete operations
+│   ├── record.go             # Binary encoder/decoder, CRC32, boundary validation
+│   ├── recovery.go           # Crash-safe sequential recovery scan & torn-tail truncation
+│   ├── storage.go            # Durable append, WriteAt, fsync, and rollback
+│   └── *_test.go             # 94 unit, concurrency, recovery, and invariant tests
+├── go.mod                    # Root module definition (module killitdb)
+├── README.md                 # Project architecture & status
+└── TEST_PLAN.md              # 11-layer end-to-end testing & crash verification plan
+```
+
+### Component Ownership
+| Component | Directory | Package | Ownership | Responsibility |
+|---|---|---|---|---|
+| **Database Engine Core** | `src/` | `killitdb` | **Our Role** | Storage format, atomic batch, durable sync, recovery, in-memory index. |
+| **Torture Testing Tool** | `cmd/torture/` | `main` | **Teammate 1** | Process kill injector (`kill -9`), seed-based fuzzing, crash validation. |
+| **CLI & Server** | `cmd/kvdb/` | `main` | **Teammate 2** | Terminal CLI commands (`put`, `get`, `del`, `dump`), server daemon, compaction. |
+
+Both `cmd/kvdb` and `cmd/torture` import the engine directly via:
+```go
+import "killitdb/src"
+```
+
+---
+
 ## Current Implementation Status
 
 - **Status:** Step 10 complete (Engine core verified against all invariants)

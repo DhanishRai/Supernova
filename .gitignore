@@ -1,10 +1,14 @@
-# Binaries for programs and plugins
+# Root executable binaries
+/kvdb
+/kvdb.exe
+/torture
+/torture.exe
+bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-bin/
 
 # Test binary, output, and coverage
 *.test
@@ -33,7 +37,10 @@ Thumbs.db
 *.swo
 *~
 
-# Local database files generated during runs/testing
+# Local database and temporary files generated during runs/testing
 *.db
 *.data
 *.log
+*.kv
+*.kv.tmp
+*.tmp
