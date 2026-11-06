@@ -250,12 +250,17 @@ class Reporter:
 
     def print_iteration_summary(self, rep: IterationReport) -> None:
         """Prints a single clean progress line per iteration."""
+        if isinstance(rep.delay_ms, float):
+            delay_str = f"delay={rep.delay_ms:05.2f}ms"
+        else:
+            delay_str = f"delay={rep.delay_ms:02d}ms"
+
         if rep.missed_crash_window:
             status_tag = "\033[93m[MISSED CRASH WINDOW]\033[0m"
             exit_code = rep.recovery_info.actual_exit_status if rep.recovery_info else "unknown"
             line = (
                 f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
-                f"delay={rep.delay_ms:02d}ms "
+                f"{delay_str} "
                 f"(open finished before SIGKILL; not counted) "
                 f"exit_status={exit_code} "
                 f"({rep.duration_s:.3f}s)"
@@ -265,7 +270,7 @@ class Reporter:
             if rep.mode == "recovery-crash":
                 line = (
                     f"[{rep.iteration:03d}/{rep.total_iterations:03d}] {status_tag} "
-                    f"delay={rep.delay_ms:02d}ms "
+                    f"{delay_str} "
                     f"(recovery interrupted by SIGKILL; 2nd open OK) "
                     f"keys={rep.recovered_keys:03d} "
                     f"({rep.duration_s:.3f}s)"

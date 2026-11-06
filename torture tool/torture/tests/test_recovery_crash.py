@@ -218,5 +218,45 @@ class TestRecoveryCrash(unittest.TestCase):
         self.assertEqual(ret, 0, "All 3 recovery-crash iterations must pass cleanly.")
 
 
+    def test_c2_deterministic_half_done_repair_recovery(self) -> None:
+        """
+        [C2 Timing-Independent Fallback Test]
+        Deterministically verifies that if a process crashes mid-repair (half-done truncation),
+        the subsequent open successfully recovers the database without data corruption or loss.
+        """
+        from torture.protocol import EngineClient
+        from torture.verifier import StateVerifier
+
+        # 1. Create a database with known data
+        client = EngineClient(engine_bin=FAKE_ENGINE, db_path=self.db_path)
+        with client:
+            client.put("key1", "val1", op_id="c2-op-1")
+            client.put("key2", "val2", op_id="c2-op-2")
+
+        # 2. Append a torn tail of 100 bytes
+        target_file = self.db_path if os.path.exists(self.db_path) else (self.db_path + ".wal" if os.path.exists(self.db_path + ".wal") else self.db_path + ".data")
+        size_valid = os.path.getsize(target_file)
+        with open(target_file, "ab") as f:
+            f.write(b"X" * 100)
+
+        # 3. Simulate a half-done repair by truncating by hand to mid-tail
+        size_half_done = size_valid + 40
+        with open(target_file, "r+b") as f:
+            f.truncate(size_half_done)
+
+        # 4. Open again; verify recovery completes cleanly
+        verifier = StateVerifier(engine_bin=FAKE_ENGINE, db_path=self.db_path)
+        oracle = DatabaseOracle()
+        oracle.record_put("c2-op-1", "key1", "val1")
+        oracle.record_put("c2-op-2", "key2", "val2")
+        oracle.record_ack("c2-op-1")
+        oracle.record_ack("c2-op-2")
+
+        passed, violations, dump = verifier.verify(oracle)
+        self.assertTrue(passed, f"C2 half-done repair recovery failed: {violations}")
+        self.assertIn("key1", dump)
+        self.assertIn("key2", dump)
+
+
 if __name__ == "__main__":
     unittest.main()

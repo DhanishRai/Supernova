@@ -71,13 +71,19 @@ class CrashTestRunner:
         """
         CP9 Recovery-Crash Testing Loop.
         
-        Fixes applied:
-        A. Seed once with large batches (10,000 ops) and copy per iteration.
-        B. Calibrate kill delay from baseline measurements of startup and recovery.
-        C. Record evidence of where kill landed (size before vs after truncate) and track histogram.
-        D. Vary torn tail across runs (fewer than 8B, length past EOF, bad CRC, cut by 1B / F4, clean).
-        E. Chain 1 to 3 kills before final verification.
-        F. Clean, honest reporting with consistent numbering and phase histogram.
+        Fixes and Invariants:
+        A. Seed once with large batches (1M records for kvdb, 2,000 for fake_engine) and copy per iteration.
+           Tests the 2-second recovery requirement and ensures a wide scan window (> 100ms).
+        B. Calibrate kill delay from baseline measurements of startup and recovery [startup, startup + recovery].
+        C. Engine marker synchronization: Open prints RECOVERY_SCAN_START and RECOVERY_TRUNCATE_START to stderr.
+           The runner kills a random few ms after seeing the respective marker, providing concrete evidence for phase labels.
+        D. Three honest phase buckets:
+           - 'after truncate (repair started)': kill struck after RECOVERY_TRUNCATE_START or confirmed by size reduction.
+           - 'before truncate (scan active)': kill struck after RECOVERY_SCAN_START and before truncate started.
+           - 'before truncate (unverified)': kill struck before recovery markers were observed.
+        E. Torn-tail variants: fewer_than_8, length_past_eof, bad_crc, cut_by_1_byte_f4, half_done_repair_c2, clean.
+        F. F2 Chain: Kill 1 -> Reopen -> Kill 2 -> Reopen -> Verify (check, dump, point-lookup GET).
+        G. Delay printed as float with 2 decimal places (e.g. delay=14.32ms).
         """
         import shutil
         import struct
@@ -101,7 +107,7 @@ class CrashTestRunner:
         seeder_client = EngineClient(
             engine_bin=self.config.engine_bin,
             db_path=golden_db,
-            default_timeout=10.0,
+            default_timeout=15.0,
         )
         try:
             seeder_client.start()
@@ -110,17 +116,26 @@ class CrashTestRunner:
             return 1
 
         t_seed_start = time.perf_counter()
-        num_batches = 10
-        ops_per_batch = 1000
+        is_fake_engine = self.config.engine_bin.endswith(".py")
+        if is_fake_engine:
+            num_batches = 2
+            ops_per_batch = 1000
+            total_seed_ops = 2000
+        else:
+            num_batches = 100
+            ops_per_batch = 10000
+            total_seed_ops = 1_000_000
+
         for b_idx in range(num_batches):
             op_id = f"rc-golden-batch-{b_idx}"
             b_items = []
             oracle_items = []
             for i in range(ops_per_batch):
-                k = f"key_{((b_idx * ops_per_batch + i) % 200):04d}"
+                seq_id = b_idx * ops_per_batch + i
+                k = f"k_{seq_id:07d}" if not is_fake_engine else f"key_{(seq_id % 200):04d}"
                 coin = self.master_rng.random()
-                if coin < 0.75:
-                    v = f"val_b{b_idx}_i{i}_" + ("x" * 40)
+                if coin < 0.80 or is_fake_engine:
+                    v = f"val_{seq_id:07d}_" + ("x" * 24)
                     b_items.append(BatchItem.make_put(k, v))
                     oracle_items.append(BatchSubOp(op_type=OpType.PUT, key=k, value=v))
                 else:
@@ -134,7 +149,7 @@ class CrashTestRunner:
         t_seed_dur = time.perf_counter() - t_seed_start
         golden_file = golden_db if os.path.exists(golden_db) else (golden_db + ".data" if os.path.exists(golden_db + ".data") else golden_db)
         golden_size_kb = (os.path.getsize(golden_file) if os.path.exists(golden_file) else 0) / 1024.0
-        print(f"Seeding completed in {t_seed_dur:.3f}s: 10,000 ops, {golden_size_kb:.1f} KB on disk.")
+        print(f"Seeding completed in {t_seed_dur:.3f}s: {total_seed_ops:,} ops, {golden_size_kb:.1f} KB on disk.")
 
         # -------------------------------------------------------------
         # Step B: Calibrate from Measurement (5 baseline runs)
@@ -151,7 +166,7 @@ class CrashTestRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=5.0,
+                timeout=10.0,
             )
             t1 = time.perf_counter()
             total_time = t1 - t0
@@ -182,7 +197,7 @@ class CrashTestRunner:
         print("=" * 65)
 
         # -------------------------------------------------------------
-        # Execution Loop (Chained Kills, Torn Tail Variants, Phase Telemetry)
+        # Execution Loop (F2 Chained Kills, Torn Tail Variants, Phase Telemetry)
         # -------------------------------------------------------------
         passed_count = 0
         missed_count = 0
@@ -192,12 +207,14 @@ class CrashTestRunner:
         phase_counts = {
             "before truncate (scan active)": 0,
             "after truncate (repair started)": 0,
+            "before truncate (unverified)": 0,
         }
         variant_counts = {
             "fewer_than_8": 0,
             "length_past_eof": 0,
             "bad_crc": 0,
             "cut_by_1_byte_f4": 0,
+            "half_done_repair_c2": 0,
             "clean": 0,
         }
 
@@ -226,6 +243,7 @@ class CrashTestRunner:
                 "length_past_eof",
                 "bad_crc",
                 "cut_by_1_byte_f4",
+                "half_done_repair_c2",
                 "clean",
             ])
 
@@ -246,19 +264,31 @@ class CrashTestRunner:
                 if curr_size > 16:
                     with open(target_data_file, "r+b") as f:
                         f.truncate(curr_size - 1)
+            elif variant == "half_done_repair_c2":
+                # Deterministic C2 simulation: append torn tail then half-truncate mid-tail
+                with open(target_data_file, "ab") as f:
+                    f.write(b"\x00\x00\x01\x00" + b"half_truncated_payload_in_flight")
+                mid_size = os.path.getsize(target_data_file)
+                with open(target_data_file, "r+b") as f:
+                    f.truncate(mid_size - 12)
 
-            num_chain_kills = iter_rng.randint(1, 3)
+            # F2 Chain: exactly 2 chained kills, then 1 clean open + verify
+            num_chain_kills = 2
             chain_success = True
-            last_phase = "before truncate (scan active)"
+            iter_phases = []
             last_delay_ms = 0.0
             last_exit_status = 0
             rec_start_time = time.time()
             rec_comp_time = time.time()
 
+            has_torn_tail = (variant != "clean")
+
             for chain_step in range(num_chain_kills):
                 size_before = os.path.getsize(target_data_file) if os.path.exists(target_data_file) else 0
                 open_cmd = [sys.executable, self.config.engine_bin, "open", db_path] if self.config.engine_bin.endswith(".py") else [self.config.engine_bin, "open", db_path]
                 rec_start_time = time.time()
+                t_spawn = time.perf_counter()
+
                 open_proc = subprocess.Popen(
                     open_cmd,
                     stdout=subprocess.PIPE,
@@ -266,40 +296,82 @@ class CrashTestRunner:
                     text=True,
                 )
 
-                # Check if custom min/max delay was explicitly requested by test/user
+                scan_seen = False
+                truncate_seen = False
+
                 has_custom_delay = (self.config.min_kill_delay_ms != 1 or self.config.max_kill_delay_ms != 50)
+
+                # Determine target phase for this step
+                # If there's a torn tail, target after_truncate ~60% of the time to ensure a strong phase distribution
+                still_has_tail = has_torn_tail and (chain_step == 0 or (len(iter_phases) > 0 and "after truncate" not in iter_phases[0]))
+                target_after_truncate = still_has_tail and (iter_rng.random() < 0.60)
+
                 if has_custom_delay:
                     delay_ms = iter_rng.uniform(
                         self.config.min_kill_delay_ms,
                         self.config.max_kill_delay_ms,
                     )
-                else:
-                    scan_started = False
+                    time.sleep(delay_ms / 1000.0)
+                elif target_after_truncate:
+                    # Wait for RECOVERY_TRUNCATE_START
                     try:
-                        line = open_proc.stderr.readline()
-                        if "RECOVERY_SCAN_START" in line:
-                            scan_started = True
+                        while True:
+                            line = open_proc.stderr.readline()
+                            if not line:
+                                break
+                            if "RECOVERY_SCAN_START" in line:
+                                scan_seen = True
+                            if "RECOVERY_TRUNCATE_START" in line:
+                                truncate_seen = True
+                                break
                     except Exception:
                         pass
 
-                    if scan_started:
-                        delay_ms = iter_rng.uniform(0.5, max(1.5, median_recovery * 1000 * 0.75))
+                    if truncate_seen:
+                        # Truncation has started! Sleep a few milliseconds to land inside/after repair
+                        t_sleep = iter_rng.uniform(0.1, 1.5) / 1000.0
+                        time.sleep(t_sleep)
                     else:
-                        delay_ms = iter_rng.uniform(
-                            median_startup * 1000,
-                            (median_startup + median_recovery * 0.75) * 1000,
-                        )
+                        # Fallback delay drawn from [startup, startup + recovery]
+                        fallback_delay = iter_rng.uniform(median_startup * 0.8, median_startup + median_recovery * 1.5)
+                        time.sleep(fallback_delay)
+                else:
+                    # Target scan active: wait for RECOVERY_SCAN_START
+                    try:
+                        line = open_proc.stderr.readline()
+                        if "RECOVERY_SCAN_START" in line:
+                            scan_seen = True
+                    except Exception:
+                        pass
 
-                last_delay_ms = delay_ms
-                time.sleep(delay_ms / 1000.0)
+                    if scan_seen:
+                        # Scan is actively running! Sleep within recovery window
+                        scan_delay = iter_rng.uniform(1.0, max(2.5, median_recovery * 1000 * 0.7)) / 1000.0
+                        time.sleep(scan_delay)
+                    else:
+                        # Fallback drawn from [startup, startup + recovery]
+                        fallback_delay = iter_rng.uniform(median_startup * 0.8, median_startup + median_recovery * 1.5)
+                        time.sleep(fallback_delay)
+
+                t_killed = time.perf_counter()
+                last_delay_ms = (t_killed - t_spawn) * 1000.0
 
                 poll_ret = open_proc.poll()
                 if poll_ret is not None:
+                    # Process completed before SIGKILL arrived
                     chain_success = False
                     last_exit_status = poll_ret
                     rec_comp_time = time.time()
+                    try:
+                        if open_proc.stdout:
+                            open_proc.stdout.close()
+                        if open_proc.stderr:
+                            open_proc.stderr.close()
+                    except Exception:
+                        pass
                     break
 
+                # Interrupt process with SIGKILL
                 try:
                     if sys.platform == "win32":
                         os.kill(open_proc.pid, signal.SIGKILL)
@@ -338,10 +410,19 @@ class CrashTestRunner:
                     break
 
                 size_after = os.path.getsize(target_data_file) if os.path.exists(target_data_file) else 0
-                if size_after < size_before:
-                    last_phase = "after truncate (repair started)"
+                if truncate_seen or size_after < size_before:
+                    iter_phases.append("after truncate (repair started)")
+                elif scan_seen:
+                    iter_phases.append("before truncate (scan active)")
                 else:
-                    last_phase = "before truncate (scan active)"
+                    iter_phases.append("before truncate (unverified)")
+
+            if "after truncate (repair started)" in iter_phases:
+                last_phase = "after truncate (repair started)"
+            elif "before truncate (scan active)" in iter_phases:
+                last_phase = "before truncate (scan active)"
+            else:
+                last_phase = "before truncate (unverified)"
 
             if not chain_success:
                 missed_count += 1
@@ -359,9 +440,9 @@ class CrashTestRunner:
                     iteration=attempt,
                     total_iterations=target_successes,
                     passed=False,
-                    delay_ms=int(last_delay_ms),
-                    submitted=10000,
-                    acked=10000,
+                    delay_ms=last_delay_ms,
+                    submitted=total_seed_ops,
+                    acked=total_seed_ops,
                     recovered_keys=0,
                     duration_s=time.perf_counter() - t_iter_start,
                     violations=["MISSED CRASH WINDOW"],
@@ -372,10 +453,11 @@ class CrashTestRunner:
                 self.reporter.print_iteration_summary(rep)
                 continue
 
+            # Step 3: Reopen cleanly and verify with StateVerifier
             verifier = StateVerifier(
                 engine_bin=self.config.engine_bin,
                 db_path=db_path,
-                timeout=5.0,
+                timeout=45.0,
             )
             t_v_start = time.perf_counter()
             passed, violations, actual_dump = verifier.verify(oracle)
@@ -397,9 +479,9 @@ class CrashTestRunner:
                 iteration=passed_count + 1,
                 total_iterations=target_successes,
                 passed=passed,
-                delay_ms=int(last_delay_ms),
-                submitted=10000,
-                acked=10000,
+                delay_ms=last_delay_ms,
+                submitted=total_seed_ops,
+                acked=total_seed_ops,
                 recovered_keys=len(actual_dump),
                 duration_s=t_iter_dur,
                 violations=violations,

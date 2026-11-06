@@ -196,15 +196,19 @@ func (db *DB) ForEach(fn func(key string, val []byte) error) error {
 	keys := db.index.Keys()
 	sort.Strings(keys)
 
+	var valBuf []byte
+
 	for _, k := range keys {
 		ent, found := db.index.Get(k)
 		if !found {
 			continue
 		}
 
-		var valBuf []byte
 		if ent.valueLen > 0 {
-			valBuf = make([]byte, ent.valueLen)
+			if uint32(cap(valBuf)) < ent.valueLen {
+				valBuf = make([]byte, ent.valueLen)
+			}
+			valBuf = valBuf[:ent.valueLen]
 			n, err := db.file.ReadAt(valBuf, ent.valueOffset)
 			if err != nil && err != io.EOF {
 				return fmt.Errorf("read value failed for key %s: %w", k, err)
@@ -212,12 +216,13 @@ func (db *DB) ForEach(fn func(key string, val []byte) error) error {
 			if n != int(ent.valueLen) {
 				return fmt.Errorf("short read for value of key %s at offset %d: expected %d, got %d", k, ent.valueOffset, ent.valueLen, n)
 			}
+			if err := fn(k, valBuf); err != nil {
+				return err
+			}
 		} else {
-			valBuf = []byte{}
-		}
-
-		if err := fn(k, valBuf); err != nil {
-			return err
+			if err := fn(k, nil); err != nil {
+				return err
+			}
 		}
 	}
 

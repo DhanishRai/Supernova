@@ -3,6 +3,7 @@ package killitdb
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 )
 
 // recoverDatabase performs crash-safe scanning and rebuilding of the in-memory index
@@ -76,6 +77,7 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 	}
 
 	// 3. Scan records starting at offset 16.
+	fmt.Fprintln(os.Stderr, "RECOVERY_SCAN_START")
 	index := newIndex()
 	scanOffset := int64(HeaderSize)
 
@@ -145,6 +147,7 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 
 	// 4. If an incomplete or torn tail exists, truncate and sync.
 	if scanOffset < fileSize {
+		fmt.Fprintln(os.Stderr, "RECOVERY_TRUNCATE_START")
 		if err := file.Truncate(scanOffset); err != nil {
 			return nil, 0, fmt.Errorf("failed to truncate torn tail to %d: %w", scanOffset, err)
 		}

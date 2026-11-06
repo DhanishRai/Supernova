@@ -55,6 +55,8 @@ def do_open(db_path: str) -> int:
         except ValueError:
             pass
 
+    sys.stderr.write("RECOVERY_SCAN_START\n")
+    sys.stderr.flush()
     wal = get_wal_path(db_path)
     data = get_data_path(db_path)
 
@@ -92,6 +94,8 @@ def do_open(db_path: str) -> int:
         except Exception:
             pass
 
+    sys.stderr.write("RECOVERY_TRUNCATE_START\n")
+    sys.stderr.flush()
     with open(data, "w", encoding="utf-8") as f:
         json.dump(state, f)
         f.flush()

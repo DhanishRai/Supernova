@@ -73,8 +73,6 @@ func runOpen(args []string) {
 		os.Exit(1)
 	}
 	dbPath := args[0]
-	fmt.Fprintln(os.Stderr, "RECOVERY_SCAN_START")
-
 	start := time.Now()
 	db, err := killitdb.Open(dbPath, defaultMaxBytes)
 	if err != nil {
@@ -120,14 +118,25 @@ func runDump(args []string) {
 	}
 	defer db.Close()
 
-	writer := bufio.NewWriter(os.Stdout)
+	writer := bufio.NewWriterSize(os.Stdout, 256*1024)
+	space := []byte(" ")
+	nl := []byte("\n")
 	err = db.ForEach(func(k string, v []byte) error {
-		if len(v) == 0 {
-			_, err := fmt.Fprintf(writer, "%s\n", k)
+		if _, err := writer.WriteString(k); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(writer, "%s %s\n", k, string(v))
-		return err
+		if len(v) > 0 {
+			if _, err := writer.Write(space); err != nil {
+				return err
+			}
+			if _, err := writer.Write(v); err != nil {
+				return err
+			}
+		}
+		if _, err := writer.Write(nl); err != nil {
+			return err
+		}
+		return nil
 	})
 	_ = writer.Flush()
 
