@@ -144,6 +144,7 @@ class CrashTestRunner:
 
             golden_oracle.record_batch(op_id, oracle_items, writer_id="golden-seeder")
             seeder_client.batch(b_items, op_id=op_id)
+            golden_oracle.record_ack(op_id)
 
         seeder_client.close()
         t_seed_dur = time.perf_counter() - t_seed_start
@@ -232,11 +233,7 @@ class CrashTestRunner:
             if os.path.exists(golden_db + ".wal"):
                 shutil.copyfile(golden_db + ".wal", db_path + ".wal")
 
-            oracle = DatabaseOracle()
-            with golden_oracle._lock:
-                oracle._seq_counter = golden_oracle._seq_counter
-                oracle._history = list(golden_oracle._history)
-                oracle._history_by_id = dict(golden_oracle._history_by_id)
+            oracle = golden_oracle.clone()
 
             variant = iter_rng.choice([
                 "fewer_than_8",
@@ -264,6 +261,14 @@ class CrashTestRunner:
                 if curr_size > 16:
                     with open(target_data_file, "r+b") as f:
                         f.truncate(curr_size - 1)
+                # The trailing record was torn by cutting the file by 1 byte.
+                # Mark ONLY this final batch as unACKed in the oracle copy;
+                # all previous batches 0..(num_batches-2) MUST strictly survive.
+                last_batch_id = f"rc-golden-batch-{num_batches - 1}"
+                last_rec = oracle.get_record(last_batch_id)
+                if last_rec:
+                    last_rec.acked = False
+                    last_rec.resolved_at = None
             elif variant == "half_done_repair_c2":
                 # Deterministic C2 simulation: append torn tail then half-truncate mid-tail
                 with open(target_data_file, "ab") as f:

@@ -257,6 +257,49 @@ class TestRecoveryCrash(unittest.TestCase):
         self.assertIn("key1", dump)
         self.assertIn("key2", dump)
 
+    def test_recovery_crash_sabotage_missing_seed_key_detected(self) -> None:
+        """
+        [SABOTAGE TEST - Item 10]
+        Proves that if an engine drops even a single ACKed seed record during recovery-crash,
+        the torture tool detects DURABILITY VIOLATION, preserves artifacts, and exits with code 1.
+        """
+        os.environ["SUPERNOVA_RECOVERY_DELAY_MS"] = "35"
+
+        config = TortureConfig(
+            iterations=1,
+            seed=12345,
+            mode=TortureMode.RECOVERY_CRASH,
+            engine_bin=FAKE_ENGINE,
+            db_path=self.db_path,
+            min_kill_delay_ms=2,
+            max_kill_delay_ms=8,
+            artifacts_dir=self.artifacts_dir,
+        )
+
+        from torture.verifier import StateVerifier
+        original_verify = StateVerifier.verify
+
+        def sabotaged_verify(self_v, oracle):
+            passed, violations, dump = original_verify(self_v, oracle)
+            if dump:
+                sabotaged_dump = dict(dump)
+                any_key = next(iter(sabotaged_dump.keys()))
+                del sabotaged_dump[any_key]
+                res = oracle.verify_recovered_dump(sabotaged_dump)
+                return (res.passed, res.violations, sabotaged_dump)
+            return passed, violations, dump
+
+        runner = CrashTestRunner(config)
+        with patch.object(StateVerifier, "verify", side_effect=sabotaged_verify, autospec=True):
+            ret = runner.run()
+
+        self.assertEqual(ret, 1, "Torture tool MUST fail when an ACKed seed key is missing!")
+        subdirs = [d for d in os.listdir(self.artifacts_dir) if os.path.isdir(os.path.join(self.artifacts_dir, d))]
+        self.assertGreaterEqual(len(subdirs), 1, "Failure artifacts must be preserved")
+        with open(os.path.join(self.artifacts_dir, subdirs[0], "failure_report.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertTrue(any("DURABILITY VIOLATION" in err for err in data.get("errors", [])))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ Core Responsibilities:
 4. Verifies a recovered database dump against the oracle's invariants.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
 import threading
@@ -141,6 +141,15 @@ class DatabaseOracle:
         self._seq_counter = 0
         self._history: List[OperationRecord] = []
         self._history_by_id: Dict[str, OperationRecord] = {}
+
+    def clone(self) -> "DatabaseOracle":
+        """Returns an independent deep copy of the Oracle and its operation history."""
+        with self._lock:
+            cp = DatabaseOracle()
+            cp._seq_counter = self._seq_counter
+            cp._history = [replace(r) for r in self._history]
+            cp._history_by_id = {r.op_id: r for r in cp._history}
+            return cp
 
     @property
     def history_length(self) -> int:

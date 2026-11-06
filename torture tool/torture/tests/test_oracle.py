@@ -242,6 +242,64 @@ class TestDatabaseOracle(unittest.TestCase):
         self.assertFalse(res_corrupt.passed)
 
 
+    def test_oracle_clone_isolation(self) -> None:
+        """Verifies that clone() creates an independent copy of history and records."""
+        self.oracle.record_put("op-1", "k1", "v1")
+        self.oracle.record_ack("op-1")
+
+        cloned = self.oracle.clone()
+        rec_cloned = cloned.get_record("op-1")
+        self.assertIsNotNone(rec_cloned)
+        self.assertTrue(rec_cloned.acked)
+
+        # Un-ACK the cloned record (like cut_by_1_byte_f4 does for the last batch)
+        rec_cloned.acked = False
+
+        # Cloned record is unACKed, but original MUST remain ACKed
+        self.assertFalse(cloned.get_record("op-1").acked)
+        self.assertTrue(self.oracle.get_record("op-1").acked)
+
+    def test_f4_scoping_durability_enforcement(self) -> None:
+        """
+        [Item 10 Proof]
+        Verifies that seed batches marked ACKed are strictly required by the oracle.
+        In F4, only the final truncated batch is allowed to be discarded;
+        dropping any earlier batch results in DURABILITY VIOLATION.
+        """
+        # Batch 0 and Batch 1 are ACKed seed batches
+        self.oracle.record_batch(
+            "rc-golden-batch-0",
+            [BatchSubOp(OpType.PUT, "k0", "v0"), BatchSubOp(OpType.PUT, "k1", "v1")]
+        )
+        self.oracle.record_ack("rc-golden-batch-0")
+
+        self.oracle.record_batch(
+            "rc-golden-batch-1",
+            [BatchSubOp(OpType.PUT, "k2", "v2"), BatchSubOp(OpType.PUT, "k3", "v3")]
+        )
+        self.oracle.record_ack("rc-golden-batch-1")
+
+        # In F4, the last batch is truncated and unACKed in the clone
+        f4_oracle = self.oracle.clone()
+        last_rec = f4_oracle.get_record("rc-golden-batch-1")
+        last_rec.acked = False
+
+        # Valid F4 recovery: batch 0 present, batch 1 discarded
+        res_valid = f4_oracle.verify_recovered_dump({"k0": "v0", "k1": "v1"})
+        self.assertTrue(res_valid.passed, f"Valid F4 recovery failed: {res_valid.violations}")
+
+        # Invalid F4 recovery (sabotage): batch 0 dropped as well
+        res_sabotage_b0 = f4_oracle.verify_recovered_dump({})
+        self.assertFalse(res_sabotage_b0.passed, "Dropping ACKed batch 0 in F4 must fail!")
+        self.assertTrue(any("DURABILITY VIOLATION" in v for v in res_sabotage_b0.violations))
+
+        # Non-F4 recovery: both batch 0 and batch 1 must be present
+        res_non_f4_missing_b1 = self.oracle.verify_recovered_dump({"k0": "v0", "k1": "v1"})
+        self.assertFalse(res_non_f4_missing_b1.passed, "Non-F4 must strictly require all seed batches!")
+        self.assertTrue(any("DURABILITY VIOLATION" in v for v in res_non_f4_missing_b1.violations))
+
+
+
 if __name__ == "__main__":
     unittest.main()
 
