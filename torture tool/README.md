@@ -12,11 +12,21 @@ The torture tool is an adversarial testing harness designed to break our Go key-
 4. **Recovery Resilience**: Recovery from crashes never corrupts the database or crashes the engine upon subsequent runs.
 5. **Compaction Safety**: Compaction preserves all acknowledged data.
 
-## Current Stage: CP1 (Foundation, Configuration, and Protocol Wire Contract)
-In Checkpoint 1, we establish:
+## Stages Completed
+### CP1: Foundation, Configuration, and Protocol Wire Contract
 - **`config.py`**: Strict argument parsing, deterministic random seed management, failure mode selection (`default`, `large-values`, `large-batches`, `compaction`, `recovery-crash`), and execution budgets.
-- **`protocol.py`**: The wire protocol contract between the torture harness and `./kvdb serve`. Models discrete database operations (`PUT`, `DEL`, `BATCH`), serialization to `stdin`, and parsing of asynchronous `ACK <op-id>` confirmations from `stdout`.
-- **`tests/`**: Comprehensive test suite using Python 3 standard library `unittest` (no external dependencies).
+- **`main.py`**: CLI entry point and validation.
+
+### CP2: CLI Communication and Protocol Handling (`serve` mode)
+- **`protocol.py`**: Production-grade client engine controller managing `./kvdb serve <path>`:
+  - Wire format: `PUT <id> <hexkey> <hexvalue>`, `DEL <id> <hexkey>`, `BATCH <id> P:... D:...`, `COMPACT <id>`.
+  - Responses: `ACK <id>`, `ERR <id> <message>`.
+  - **Single Dedicated Reader**: Exactly one thread reading stdout to ensure sequential consumption without response loss.
+  - **Stderr Drainer**: Dedicated thread draining stderr into a bounded circular buffer, preventing pipe-buffer deadlocks.
+  - **Thread-Safe Submission**: Mutex-guarded `stdin` writes with explicit flush.
+  - **Asynchronous Matching**: `threading.Event`-based pending operation table keyed by unique operation IDs.
+  - **Resilience**: Full detection of unknown IDs, malformed responses, broken pipes, unexpected EOF on crash, timeouts, and orphan cleanup via `SIGKILL`.
+- **`tests/fake_engine.py`**: Controllable mock engine process simulating `./kvdb serve` for deterministic edge-case testing.
 
 ## Running Tests
 From `Supernova/torture tool`:

@@ -174,3 +174,126 @@ Implement only CP1.
 
 Do not proceed to CP2 automatically.
 ```
+
+
+---
+
+### Entry 2
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 14:51:21 IST
+- **Development Stage**: CP2 (CLI Communication & Protocol Handling)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP2: CLI communication and protocol handling.
+
+FIRST:
+
+Inspect the current CP1 implementation and the actual Go CLI.
+
+Agreed command:
+
+./kvdb serve <path>
+
+Protocol:
+
+PUT <id> <hexkey> <hexvalue>
+
+DEL <id> <hexkey>
+
+BATCH <id> P:<hexkey>:<hexvalue> D:<hexkey>
+
+COMPACT <id>
+
+Responses:
+
+ACK <id>
+
+ERR <id> <message>
+
+IMPORTANT:
+
+Inspect actual engine behaviour before assuming protocol details.
+
+IMPLEMENT:
+
+Create torture/protocol.py.
+
+Use subprocess.Popen.
+
+Configure:
+
+- stdin pipe.
+- stdout pipe.
+- stderr independently drained or safely captured.
+- Explicit encoding.
+- Proper process tracking.
+- Timeouts.
+- Reliable cleanup.
+
+Implement:
+
+1. Command encoding.
+2. PUT.
+3. DEL.
+4. BATCH.
+5. COMPACT.
+6. Unique operation IDs.
+7. One dedicated stdout reader thread.
+8. Thread-safe stdin writing.
+9. ACK parsing.
+10. ERR parsing.
+11. Unknown ID detection.
+12. Malformed response detection.
+13. Unexpected EOF handling.
+14. Broken-pipe handling.
+15. Child termination handling.
+
+CRITICAL:
+
+There must be exactly one stdout reader.
+
+Never treat successful stdin transmission as an ACK.
+
+Protect command writes using a lock.
+
+Flush commands appropriately.
+
+TEST:
+
+Use a temporary fake CLI process if the real engine is unavailable.
+
+Test:
+
+- ACK.
+- ERR.
+- Unknown IDs.
+- Malformed responses.
+- Unexpected EOF.
+- Broken pipes.
+- Child process crash.
+- Timeout.
+- Multiple concurrent submissions.
+- Command interleaving.
+
+Clearly identify fake-engine tests.
+
+REVIEW:
+
+Look for deadlocks, race conditions, response loss, and orphan processes.
+
+GIT COMMIT:
+
+add serve protocol handling
+
+Report the tests and commit hash.
+
+Explain the protocol design.
+
+STOP after CP2.
+```

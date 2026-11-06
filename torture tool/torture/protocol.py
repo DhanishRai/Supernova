@@ -1,185 +1,549 @@
 """
-Wire protocol definition and serialization for the Supernova storage engine.
+Wire protocol implementation and engine communication client for Supernova.
 
-Handles formatting operations sent to the engine's `serve` mode via stdin,
-and parsing incoming responses (such as `ACK <op-id>`) from stdout.
+Implements the agreed protocol:
+    Commands (sent to ./kvdb serve <path> via stdin):
+        PUT <id> <hexkey> <hexvalue>
+        DEL <id> <hexkey>
+        BATCH <id> P:<hexkey>:<hexvalue> D:<hexkey> ...
+        COMPACT <id>
+
+    Responses (received from stdout):
+        ACK <id>
+        ERR <id> <message>
+
+Concurrency & Safety Guarantees:
+- Exactly ONE dedicated stdout reader thread.
+- One dedicated stderr drain thread (prevents child process pipe-buffer deadlocks).
+- Thread-safe command serialization & stdin writes guarded by a write lock.
+- Immediate flushing of stdin after every command.
+- Asynchronous response matching by unique operation ID using threading.Event.
+- Detection of unknown IDs, malformed responses, unexpected EOF, broken pipes, and timeouts.
+- Never treats successful stdin write as an ACK.
+- Robust process tracking and resource cleanup (no orphan processes).
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+import itertools
+import os
 import re
-from typing import List, Optional, Tuple, Union
+import signal
+import subprocess
+import threading
+import time
+from typing import Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 
-class OpType(str, Enum):
-    PUT = "put"
-    DEL = "del"
-    BATCH = "batch"
+# --- Utility Functions for Hex Encoding ---
+
+def to_hex(data: Union[str, bytes]) -> str:
+    """Encodes string or bytes into lowercase hexadecimal string."""
+    if isinstance(data, str):
+        return data.encode("utf-8").hex()
+    elif isinstance(data, (bytes, bytearray)):
+        return bytes(data).hex()
+    raise TypeError(f"Expected str or bytes, got {type(data).__name__}")
+
+
+def from_hex(hex_str: str) -> bytes:
+    """Decodes hexadecimal string back to raw bytes."""
+    return bytes.fromhex(hex_str.strip())
+
+
+def from_hex_str(hex_str: str) -> str:
+    """Decodes hexadecimal string back to UTF-8 string."""
+    return from_hex(hex_str).decode("utf-8", errors="replace")
+
+
+# --- Custom Protocol Exceptions ---
+
+class ProtocolError(Exception):
+    """Base exception for protocol-level errors."""
+    pass
+
+
+class EngineError(ProtocolError):
+    """Raised when engine returns an explicit ERR response."""
+    def __init__(self, op_id: str, message: str) -> None:
+        super().__init__(f"Engine rejected op '{op_id}': {message}")
+        self.op_id = op_id
+        self.message = message
+
+
+class EngineTimeoutError(ProtocolError):
+    """Raised when an operation does not receive an ACK/ERR within timeout."""
+    pass
+
+
+class UnexpectedEOFError(ProtocolError):
+    """Raised when engine process closes stdout unexpectedly while operations are pending."""
+    pass
+
+
+class EngineProcessError(ProtocolError):
+    """Raised when engine process fails to start or dies unexpectedly."""
+    pass
+
+
+# --- Data Structures ---
+
+class CommandType(str, Enum):
+    PUT = "PUT"
+    DEL = "DEL"
+    BATCH = "BATCH"
+    COMPACT = "COMPACT"
 
 
 @dataclass(frozen=True)
-class SubOp:
+class BatchItem:
     """
-    Sub-operation within an atomic batch.
+    Sub-operation in a BATCH command:
+    - PUT: P:<hexkey>:<hexval>
+    - DEL: D:<hexkey>
     """
-    op_type: OpType  # PUT or DEL
-    key: str
-    value: Optional[str] = None
+    is_put: bool
+    key_hex: str
+    value_hex: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.op_type not in (OpType.PUT, OpType.DEL):
-            raise ValueError(f"Batch sub-op must be put or del, got {self.op_type}")
-        if not self.key:
-            raise ValueError("Batch sub-op key cannot be empty")
-        if len(self.key.encode("utf-8")) > 1024:
-            raise ValueError("Key exceeds maximum length of 1024 bytes")
-        if self.op_type == OpType.PUT and self.value is None:
-            raise ValueError("PUT sub-op requires a value")
-        if self.op_type == OpType.DEL and self.value is not None:
-            raise ValueError("DEL sub-op cannot have a value")
+        if self.is_put and self.value_hex is None:
+            raise ValueError("PUT batch item requires value_hex")
+        if not self.is_put and self.value_hex is not None:
+            raise ValueError("DEL batch item cannot have value_hex")
+
+    @classmethod
+    def make_put(cls, key: Union[str, bytes], value: Union[str, bytes]) -> "BatchItem":
+        return cls(is_put=True, key_hex=to_hex(key), value_hex=to_hex(value))
+
+    @classmethod
+    def make_del(cls, key: Union[str, bytes]) -> "BatchItem":
+        return cls(is_put=False, key_hex=to_hex(key))
+
+    def encode(self) -> str:
+        if self.is_put:
+            return f"P:{self.key_hex}:{self.value_hex}"
+        return f"D:{self.key_hex}"
 
 
 @dataclass(frozen=True)
-class Operation:
-    """
-    A top-level client operation submitted to the engine's serve mode.
-    Every operation carries a unique op_id used to match asynchronous ACKs.
-    """
+class ProtocolResponse:
+    """Parsed response from the engine stdout."""
+    status: str  # "ACK" or "ERR"
     op_id: str
-    op_type: OpType
-    key: Optional[str] = None
-    value: Optional[str] = None
-    sub_ops: Tuple[SubOp, ...] = field(default_factory=tuple)
+    message: Optional[str] = None
+    is_ack: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        if not self.op_id or not self.op_id.strip():
-            raise ValueError("op_id cannot be empty")
-        if self.op_type == OpType.PUT:
-            if not self.key:
-                raise ValueError("PUT operation requires a key")
-            if self.value is None:
-                raise ValueError("PUT operation requires a value")
-            if len(self.key.encode("utf-8")) > 1024:
-                raise ValueError("Key exceeds 1024 bytes limit")
-            if len(self.value.encode("utf-8")) > 1_048_576:
-                raise ValueError("Value exceeds 1 MB limit")
-        elif self.op_type == OpType.DEL:
-            if not self.key:
-                raise ValueError("DEL operation requires a key")
-            if len(self.key.encode("utf-8")) > 1024:
-                raise ValueError("Key exceeds 1024 bytes limit")
-            if self.value is not None:
-                raise ValueError("DEL operation cannot specify a value")
-        elif self.op_type == OpType.BATCH:
-            if not self.sub_ops:
-                raise ValueError("BATCH operation requires at least one sub-op")
-            if len(self.sub_ops) > 10_000:
-                raise ValueError("BATCH exceeds 10,000 operations limit")
+        object.__setattr__(self, "is_ack", self.status == "ACK")
 
-    @classmethod
-    def make_put(cls, op_id: str, key: str, value: str) -> "Operation":
-        return cls(op_id=str(op_id), op_type=OpType.PUT, key=key, value=value)
 
-    @classmethod
-    def make_del(cls, op_id: str, key: str) -> "Operation":
-        return cls(op_id=str(op_id), op_type=OpType.DEL, key=key)
+class IdGenerator:
+    """Thread-safe monotonic operation ID generator."""
 
-    @classmethod
-    def make_batch(cls, op_id: str, sub_ops: List[SubOp]) -> "Operation":
-        return cls(op_id=str(op_id), op_type=OpType.BATCH, sub_ops=tuple(sub_ops))
+    def __init__(self, prefix: str = "op") -> None:
+        self._prefix = prefix
+        self._counter = itertools.count(1)
+        self._lock = threading.Lock()
 
+    def next_id(self) -> str:
+        with self._lock:
+            val = next(self._counter)
+        return f"{self._prefix}-{val}"
+
+
+@dataclass
+class _PendingOp:
+    """Internal tracker for an in-flight operation awaiting ACK or ERR."""
+    op_id: str
+    event: threading.Event = field(default_factory=threading.Event)
+    response: Optional[ProtocolResponse] = None
+    exception: Optional[Exception] = None
+
+
+# --- Wire Formatter and Parser ---
 
 class ProtocolCodec:
-    """
-    Encodes operations for transmission over stdin and decodes engine responses from stdout.
-    
-    Standard Line Protocol:
-      PUT:   `put <op_id> <key> <value>\n`
-      DEL:   `del <op_id> <key>\n`
-      BATCH: `batch <op_id> <count>\n` followed by `<put|del> <key> [value]\n` for each sub-op.
+    """Encodes commands and parses responses according to the agreed wire protocol."""
 
-    Engine Acknowledgements:
-      `ACK <op_id>\n`  -> Confirms operation is durable on disk (fsync complete).
-      `ERR <op_id> <reason>\n` -> Operation rejected (e.g. disk full / max-bytes reached).
-    """
-
-    ACK_PATTERN = re.compile(r"^ACK\s+(\S+)")
-    ERR_PATTERN = re.compile(r"^ERR\s+(\S+)(?:\s+(.*))?")
+    # Regex for responses
+    ACK_RE = re.compile(r"^ACK\s+(\S+)\s*$")
+    ERR_RE = re.compile(r"^ERR\s+(\S+)(?:\s+(.*))?$")
 
     @staticmethod
-    def encode_operation(op: Operation) -> str:
-        """
-        Serializes an Operation into wire format string to be written to stdin.
-        """
-        if op.op_type == OpType.PUT:
-            return f"put {op.op_id} {op.key} {op.value}\n"
-        elif op.op_type == OpType.DEL:
-            return f"del {op.op_id} {op.key}\n"
-        elif op.op_type == OpType.BATCH:
-            lines = [f"batch {op.op_id} {len(op.sub_ops)}"]
-            for sub in op.sub_ops:
-                if sub.op_type == OpType.PUT:
-                    lines.append(f"put {sub.key} {sub.value}")
-                else:
-                    lines.append(f"del {sub.key}")
-            return "\n".join(lines) + "\n"
-        raise ValueError(f"Unknown op_type: {op.op_type}")
+    def encode_put(op_id: str, key: Union[str, bytes], value: Union[str, bytes]) -> str:
+        return f"PUT {op_id} {to_hex(key)} {to_hex(value)}\n"
+
+    @staticmethod
+    def encode_del(op_id: str, key: Union[str, bytes]) -> str:
+        return f"DEL {op_id} {to_hex(key)}\n"
+
+    @staticmethod
+    def encode_batch(op_id: str, items: Iterable[BatchItem]) -> str:
+        items_str = " ".join(item.encode() for item in items)
+        if not items_str:
+            raise ValueError("BATCH must contain at least one operation")
+        return f"BATCH {op_id} {items_str}\n"
+
+    @staticmethod
+    def encode_compact(op_id: str) -> str:
+        return f"COMPACT {op_id}\n"
 
     @classmethod
-    def parse_response_line(cls, line: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    def parse_response_line(cls, line: str) -> Tuple[Optional[ProtocolResponse], bool]:
         """
-        Parses a single line received from engine stdout.
+        Parses a line received from stdout.
         Returns:
-            Tuple of (status, op_id, optional_message)
-            e.g. ("ACK", "op_123", None)
-                 ("ERR", "op_124", "disk full")
-            or None if the line is not a recognized protocol response (e.g. debug logging, empty line, torn fragment).
+            (ProtocolResponse, is_malformed=False) if valid ACK or ERR.
+            (None, is_malformed=False) if empty or ignorable whitespace.
+            (None, is_malformed=True) if non-empty but does not match protocol.
         """
         cleaned = line.strip()
         if not cleaned:
-            return None
+            return None, False
 
-        ack_match = cls.ACK_PATTERN.match(cleaned)
+        ack_match = cls.ACK_RE.match(cleaned)
         if ack_match:
-            return ("ACK", ack_match.group(1), None)
+            return ProtocolResponse(status="ACK", op_id=ack_match.group(1)), False
 
-        err_match = cls.ERR_PATTERN.match(cleaned)
+        err_match = cls.ERR_RE.match(cleaned)
         if err_match:
             op_id = err_match.group(1)
-            reason = err_match.group(2) if err_match.group(2) else "unspecified error"
-            return ("ERR", op_id, reason)
+            msg = err_match.group(2) if err_match.group(2) else ""
+            return ProtocolResponse(status="ERR", op_id=op_id, message=msg), False
 
-        return None
+        return None, True
 
 
-class StreamDecoder:
+# --- Engine Client Process Controller ---
+
+class EngineClient:
     """
-    Handles streaming stdout bytes from the engine process, buffering fragments
-    across reads, and safely handling torn lines when SIGKILL terminates the process.
+    Manages the lifecycle of `./kvdb serve <path>` child process.
+    Provides thread-safe command execution, dedicated single-thread stdout reading,
+    and asynchronous ACK matching.
     """
 
-    def __init__(self) -> None:
-        self._buffer = ""
+    def __init__(
+        self,
+        engine_bin: str,
+        db_path: str,
+        id_generator: Optional[IdGenerator] = None,
+        default_timeout: float = 5.0,
+    ) -> None:
+        self.engine_bin = engine_bin
+        self.db_path = db_path
+        self.default_timeout = default_timeout
+        self.id_gen = id_generator or IdGenerator()
 
-    def feed(self, chunk: str) -> List[Tuple[str, str, Optional[str]]]:
-        """
-        Feeds new chunk of text from stdout, returning list of complete parsed responses.
-        Remaining incomplete line stays in the internal buffer.
-        """
-        self._buffer += chunk
-        lines = self._buffer.split("\n")
-        # The last element after split is either an incomplete line or empty string (if chunk ended with \n)
-        self._buffer = lines[-1]
+        self._proc: Optional[subprocess.Popen] = None
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending_ops: Dict[str, _PendingOp] = {}
 
-        responses = []
-        for line in lines[:-1]:
-            parsed = ProtocolCodec.parse_response_line(line)
-            if parsed is not None:
-                responses.append(parsed)
-        return responses
+        # Tracking anomaly counters / logs
+        self.unknown_ids: List[str] = []
+        self.malformed_responses: List[str] = []
+        self.stderr_lines: Deque[str] = deque(maxlen=200)
 
-    def get_remaining_unparsed(self) -> str:
+        # Worker threads
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._is_running = threading.Event()
+        self._eof_reached = threading.Event()
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._proc.pid if self._proc else None
+
+    @property
+    def is_alive(self) -> bool:
+        if self._proc is None:
+            return False
+        return self._proc.poll() is None
+
+    def start(self) -> None:
         """
-        Returns any leftover fragment in the buffer (useful for diagnostics after SIGKILL).
+        Starts the engine in `serve` mode: `./kvdb serve <path>`.
+        Configures stdin, stdout, and stderr pipes.
+        Spawns the single stdout reader thread and stderr drain thread.
         """
-        return self._buffer
+        if self.is_alive:
+            raise EngineProcessError("Engine process is already running")
+
+        cmd = [self.engine_bin, "serve", self.db_path]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,  # Unbuffered binary streams
+            )
+        except Exception as exc:
+            raise EngineProcessError(f"Failed to spawn engine '{self.engine_bin}': {exc}") from exc
+
+        self._is_running.set()
+        self._eof_reached.clear()
+
+        # Dedicated single stdout reader thread
+        self._stdout_thread = threading.Thread(
+            target=self._stdout_reader_loop,
+            name="EngineStdoutReader",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+
+        # Dedicated stderr drain thread
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_drain_loop,
+            name="EngineStderrDrain",
+            daemon=True,
+        )
+        self._stderr_thread.start()
+
+    def _stdout_reader_loop(self) -> None:
+        """
+        CRITICAL: Exactly ONE dedicated thread reading stdout line-by-line.
+        Never blocks writers; matches responses asynchronously.
+        """
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+
+        while self._is_running.is_set():
+            try:
+                line_bytes = proc.stdout.readline()
+            except Exception:
+                break
+
+            if not line_bytes:
+                # EOF reached: pipe closed or process terminated
+                break
+
+            line_str = line_bytes.decode("utf-8", errors="replace")
+            response, is_malformed = ProtocolCodec.parse_response_line(line_str)
+
+            if is_malformed:
+                with self._pending_lock:
+                    self.malformed_responses.append(line_str.strip())
+                continue
+
+            if response is None:
+                continue
+
+            # Look up pending operation
+            op_id = response.op_id
+            with self._pending_lock:
+                pending = self._pending_ops.pop(op_id, None)
+                if pending is None:
+                    self.unknown_ids.append(op_id)
+                else:
+                    pending.response = response
+                    pending.event.set()
+
+        # EOF or loop termination: fail all remaining pending ops
+        self._eof_reached.set()
+        with self._pending_lock:
+            remaining = list(self._pending_ops.values())
+            self._pending_ops.clear()
+            for pending in remaining:
+                pending.exception = UnexpectedEOFError(
+                    f"Child process terminated or stdout EOF before op '{pending.op_id}' was acknowledged"
+                )
+                pending.event.set()
+
+    def _stderr_drain_loop(self) -> None:
+        """Continuously drains stderr to avoid child process pipe-buffer deadlock."""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+
+        while self._is_running.is_set():
+            try:
+                line_bytes = proc.stderr.readline()
+            except Exception:
+                break
+            if not line_bytes:
+                break
+            line_str = line_bytes.decode("utf-8", errors="replace").strip()
+            if line_str:
+                self.stderr_lines.append(line_str)
+
+    def _send_command(self, op_id: str, wire_cmd: str, timeout: Optional[float] = None) -> ProtocolResponse:
+        """
+        Core dispatch routine:
+        1. Registers pending op.
+        2. Acquires write lock, writes to stdin, and flushes.
+        3. Waits for ACK/ERR on pending op's event.
+        4. Validates timeouts and errors.
+        """
+        if not self.is_alive or self._proc is None or self._proc.stdin is None:
+            raise EngineProcessError("Cannot send command: engine process is not running")
+
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        pending = _PendingOp(op_id=op_id)
+
+        # 1. Register pending op
+        with self._pending_lock:
+            self._pending_ops[op_id] = pending
+
+        # 2. Thread-safe write to stdin and flush
+        raw_bytes = wire_cmd.encode("utf-8")
+        try:
+            with self._write_lock:
+                if self._proc.stdin.closed:
+                    raise BrokenPipeError("stdin is closed")
+                self._proc.stdin.write(raw_bytes)
+                self._proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            with self._pending_lock:
+                self._pending_ops.pop(op_id, None)
+            raise BrokenPipeError(f"Failed to write op '{op_id}' to engine stdin: {exc}") from exc
+
+        # 3. Wait for response from dedicated stdout reader thread
+        signaled = pending.event.wait(effective_timeout)
+        if not signaled:
+            # Operation timed out
+            with self._pending_lock:
+                self._pending_ops.pop(op_id, None)
+            raise EngineTimeoutError(f"Op '{op_id}' timed out after {effective_timeout}s waiting for response")
+
+        # 4. Check for exception or response
+        if pending.exception is not None:
+            raise pending.exception
+
+        if pending.response is None:
+            raise ProtocolError(f"Op '{op_id}' signaled with neither response nor exception")
+
+        return pending.response
+
+    # --- High-level Public Operations ---
+
+    def put(
+        self,
+        key: Union[str, bytes],
+        value: Union[str, bytes],
+        op_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ProtocolResponse:
+        """Submits a PUT operation."""
+        chosen_id = op_id or self.id_gen.next_id()
+        cmd = ProtocolCodec.encode_put(chosen_id, key, value)
+        return self._send_command(chosen_id, cmd, timeout=timeout)
+
+    def delete(
+        self,
+        key: Union[str, bytes],
+        op_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ProtocolResponse:
+        """Submits a DEL operation."""
+        chosen_id = op_id or self.id_gen.next_id()
+        cmd = ProtocolCodec.encode_del(chosen_id, key)
+        return self._send_command(chosen_id, cmd, timeout=timeout)
+
+    def batch(
+        self,
+        items: Iterable[BatchItem],
+        op_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ProtocolResponse:
+        """Submits an atomic BATCH operation."""
+        chosen_id = op_id or self.id_gen.next_id()
+        cmd = ProtocolCodec.encode_batch(chosen_id, items)
+        return self._send_command(chosen_id, cmd, timeout=timeout)
+
+    def compact(
+        self,
+        op_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ProtocolResponse:
+        """Submits a COMPACT command."""
+        chosen_id = op_id or self.id_gen.next_id()
+        cmd = ProtocolCodec.encode_compact(chosen_id)
+        return self._send_command(chosen_id, cmd, timeout=timeout)
+
+    # --- Lifecycle and Process Termination ---
+
+    def close(self, wait_timeout: float = 1.0) -> int:
+        """
+        Gracefully closes engine process by closing stdin, waiting for clean exit,
+        and terminating if unresponsive.
+        """
+        self._is_running.clear()
+        if self._proc is None:
+            return 0
+
+        # Close stdin to signal EOF to engine
+        with self._write_lock:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+
+        # Wait for clean termination
+        try:
+            ret = self._proc.wait(timeout=wait_timeout)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+            try:
+                ret = self._proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                ret = self._proc.wait()
+
+        self._cleanup_threads()
+        return ret
+
+    def kill(self, sig: int = signal.SIGKILL) -> int:
+        """
+        Adversarially terminates the engine process with SIGKILL (or specified signal).
+        Verifies termination and joins worker threads.
+        """
+        self._is_running.clear()
+        if self._proc is None:
+            return 0
+
+        try:
+            os.kill(self._proc.pid, sig)
+        except ProcessLookupError:
+            pass  # Already terminated
+
+        try:
+            ret = self._proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            # Force kill if still hung
+            self._proc.kill()
+            ret = self._proc.wait()
+
+        self._cleanup_threads()
+        return ret
+
+    def _cleanup_threads(self) -> None:
+        """Ensures reader threads are joined cleanly and stream file descriptors are closed."""
+        if self._stdout_thread and self._stdout_thread.is_alive():
+            self._stdout_thread.join(timeout=1.0)
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=1.0)
+
+        if self._proc:
+            if self._proc.stdout and not self._proc.stdout.closed:
+                try:
+                    self._proc.stdout.close()
+                except Exception:
+                    pass
+            if self._proc.stderr and not self._proc.stderr.closed:
+                try:
+                    self._proc.stderr.close()
+                except Exception:
+                    pass
+
+    def __enter__(self) -> "EngineClient":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
