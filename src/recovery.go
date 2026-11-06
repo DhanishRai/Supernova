@@ -19,6 +19,12 @@ import (
 //     offset and synced before returning a usable database.
 //  4. Recovery scanning is strictly read-only until the final truncation (if needed), making
 //     recovery repeatable if interrupted by another crash during recovery.
+//
+// Performance notes:
+//   - A single record buffer is grown as needed and reused across all records; this avoids
+//     one heap allocation per record on the hot path.
+//   - decodeRecordForRecovery skips value-byte copies (values stay on disk and are not
+//     loaded into memory during recovery).
 func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 	stat, err := file.Stat()
 	if err != nil {
@@ -73,6 +79,11 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 	index := newIndex()
 	scanOffset := int64(HeaderSize)
 
+	// Reuse a single growing buffer across all records to avoid one heap
+	// allocation per record. The slice is re-sliced to fit each record's
+	// exact size without reallocating when the capacity suffices.
+	var recBuf []byte
+
 	for {
 		remaining := fileSize - scanOffset
 
@@ -82,6 +93,7 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 			break
 		}
 
+		// Peek at the outer 8-byte header to learn payloadLen.
 		var recHeader [RecordHeaderSize]byte
 		if _, err := file.ReadAt(recHeader[:], scanOffset); err != nil {
 			// Read error -> stop recovery at last valid offset.
@@ -97,14 +109,19 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 			break
 		}
 
-		// Read complete record.
-		recordBuf := make([]byte, totalRecordSize)
-		if _, err := file.ReadAt(recordBuf, scanOffset); err != nil {
+		// Grow the shared buffer only when the current record is larger.
+		if int64(cap(recBuf)) < totalRecordSize {
+			recBuf = make([]byte, totalRecordSize)
+		}
+		recBuf = recBuf[:totalRecordSize]
+
+		if _, err := file.ReadAt(recBuf, scanOffset); err != nil {
 			break
 		}
 
 		// Verify CRC and decode operations with relative offsets.
-		decodedOps, err := decodeRecordWithOffsets(recordBuf)
+		// decodeRecordForRecovery skips value-byte allocation (values stay on disk).
+		decodedOps, err := decodeRecordForRecovery(recBuf)
 		if err != nil {
 			// CRC mismatch, corrupt payload, or invalid operation data -> stop recovery.
 			break
@@ -112,7 +129,8 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 
 		// Apply operations to the in-memory index in order.
 		// absoluteValueOffset = recordStartOffset + relativeValueOffset
-		for _, op := range decodedOps {
+		for i := range decodedOps {
+			op := &decodedOps[i]
 			absValOffset := scanOffset + op.RelativeValOffset
 			index.Apply(IndexOp{
 				Type:        op.Type,
@@ -137,4 +155,3 @@ func recoverDatabase(file storageFile, maxBytes int64) (*Index, int64, error) {
 
 	return index, scanOffset, nil
 }
-

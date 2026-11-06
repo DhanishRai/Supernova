@@ -207,6 +207,113 @@ type DecodedOp struct {
 	ValueLen          uint32
 }
 
+// decodeRecordForRecovery decodes and validates a complete binary record providing
+// only the metadata needed to rebuild the index during recovery.
+//
+// Key difference from decodeRecordWithOffsets: value bytes are NOT copied into
+// DecodedOp.Value (it stays nil). Only RelativeValOffset and ValueLen are populated.
+// This eliminates O(valueLen) allocations on the hot recovery path.
+//
+// CRC validation, length bounds checking, and all correctness guarantees are preserved.
+func decodeRecordForRecovery(data []byte) ([]DecodedOp, error) {
+	if len(data) < RecordHeaderSize {
+		return nil, ErrRecordTooShort
+	}
+
+	payloadLen := binary.LittleEndian.Uint32(data[0:4])
+	expectedTotalSize := uint64(RecordHeaderSize) + uint64(payloadLen)
+
+	if expectedTotalSize > math.MaxUint32 || uint64(len(data)) != expectedTotalSize {
+		return nil, ErrRecordSizeMismatch
+	}
+
+	// Validate CRC32 (must not be skipped).
+	expectedCRC := binary.LittleEndian.Uint32(data[4:8])
+	hasher := crc32.NewIEEE()
+	hasher.Write(data[0:4])
+	hasher.Write(data[RecordHeaderSize:])
+	if hasher.Sum32() != expectedCRC {
+		return nil, ErrCRCMismatch
+	}
+
+	if payloadLen < 4 {
+		return nil, ErrTruncatedPayload
+	}
+
+	payloadOffset := RecordHeaderSize
+	opCount := binary.LittleEndian.Uint32(data[payloadOffset : payloadOffset+4])
+	payloadOffset += 4
+
+	if opCount < MinBatchOps {
+		return nil, ErrEmptyBatch
+	}
+	if opCount > MaxBatchOps {
+		return nil, ErrBatchTooLarge
+	}
+
+	payloadEnd := len(data)
+	ops := make([]DecodedOp, 0, opCount)
+
+	for i := uint32(0); i < opCount; i++ {
+		if payloadEnd-payloadOffset < OpHeaderSize {
+			return nil, ErrTruncatedPayload
+		}
+
+		opType := OperationType(data[payloadOffset])
+		payloadOffset++
+
+		if opType != OpPut && opType != OpDelete {
+			return nil, ErrInvalidOpType
+		}
+
+		keyLen := binary.LittleEndian.Uint16(data[payloadOffset : payloadOffset+2])
+		payloadOffset += 2
+
+		if keyLen < MinKeyLen || keyLen > MaxKeyLen {
+			return nil, ErrInvalidKeyLength
+		}
+
+		valLen := binary.LittleEndian.Uint32(data[payloadOffset : payloadOffset+4])
+		payloadOffset += 4
+
+		if valLen > MaxValueLen {
+			return nil, ErrInvalidValueLength
+		}
+
+		if opType == OpDelete && valLen != 0 {
+			return nil, ErrDeleteWithValue
+		}
+
+		opDataLen := uint64(keyLen) + uint64(valLen)
+		if uint64(payloadEnd-payloadOffset) < opDataLen {
+			return nil, ErrTruncatedPayload
+		}
+
+		// Convert key bytes directly to string; avoids intermediate []byte allocation.
+		key := string(data[payloadOffset : payloadOffset+int(keyLen)])
+		payloadOffset += int(keyLen)
+
+		relValOffset := int64(payloadOffset)
+
+		// Skip value bytes entirely — recovery only needs the offset.
+		payloadOffset += int(valLen)
+
+		ops = append(ops, DecodedOp{
+			Type:              opType,
+			Key:               []byte(key), // needed for IndexOp.Key (string)
+			Value:             nil,         // intentionally omitted during recovery
+			RelativeValOffset: relValOffset,
+			ValueLen:          valLen,
+		})
+	}
+
+	if payloadOffset != payloadEnd {
+		return nil, ErrTrailingData
+	}
+
+	return ops, nil
+}
+
 // decodeRecordWithOffsets decodes and validates a complete binary record, providing
 // each operation's value offset relative to the beginning of the record.
 func decodeRecordWithOffsets(data []byte) ([]DecodedOp, error) {
