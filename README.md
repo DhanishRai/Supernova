@@ -18,7 +18,7 @@ Key guarantees:
 
 ## Current Implementation Status
 
-- **Status:** Step 6 complete
+- **Status:** Step 7 complete
 - **Engine Core:**
   - Record data structures (`OperationType`, `Operation`) and validation constants implemented.
   - Binary record encoder (`encodeRecord`) implemented with full boundary validation (1–1024 byte keys, 0–1 MB values, 1–10,000 batch operations, zero-value DELETE checks, integer overflow prevention).
@@ -27,12 +27,13 @@ Key guarantees:
   - In-memory hash index (`Index` backed by `map[string]entry`) implemented with ordered batch application.
   - Database file structure and safe initialization (`Open`, `Close`, `DB` struct) implemented with 16-byte header.
   - Internal durable record append (`appendRecord`) with rollback and poison state handling.
-  - Core operations (`Put`, `Delete`, `Get`) implemented:
-    - **`Put`:** Validates key (1–1024 B) and value (0–1 MB), appends and syncs single-op record, and only updates index after successful sync.
-    - **`Delete`:** Appends and syncs durable tombstone record, then removes key from index.
-    - **`Get`:** Acquires RLock, verifies key presence, uses `ReadAt` at stored absolute offset, returns an independent copy, and cleanly distinguishes empty values from missing keys (`ErrKeyNotFound`).
-    - Full protection against closed or unusable database states.
-  - Comprehensive unit test suite expanded to 51 tests covering record serialization, indexing, file lifecycle, fault injection, and concurrent CRUD operations.
+  - Core operations (`Put`, `Delete`, `Get`) implemented with global synchronization.
+  - Atomic multi-operation batch write (`Batch`) implemented:
+    - Encodes all batch operations (1–10,000 ops) as **exactly ONE** durable on-disk record.
+    - Validates all operations upfront before acquiring write lock or executing disk I/O; rejects invalid batches with zero disk writes.
+    - Appends and issues `Sync()` before applying batch operations to the in-memory index.
+    - Guarantees strict atomicity under `db.mu.Lock`: readers cannot observe partial, intermediate, or uncommitted batch states.
+  - Comprehensive unit test suite expanded to 63 tests covering record serialization, indexing, file lifecycle, fault injection, atomic batches, and concurrency.
 
 ---
 
@@ -90,7 +91,7 @@ Each operation entry:
 - [x] **Step 4:** File header structure (16 bytes), file initialization, header validation, and open/close lifecycle.
 - [x] **Step 5:** Record append, fsync durability, and rollback on failed write.
 - [x] **Step 6:** Core operations (`Put`, `Get`, `Delete`) with global synchronization and safe value extraction.
-- [ ] **Step 7:** Atomic multi-operation batch write (`Batch`).
+- [x] **Step 7:** Atomic multi-operation batch write (`Batch`).
 - [ ] **Step 8:** Startup recovery scan & index rebuilding.
 - [ ] **Step 9:** Crash safety verification, boundary torture testing, and recovery guarantees.
 
