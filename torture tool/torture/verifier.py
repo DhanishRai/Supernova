@@ -159,21 +159,26 @@ class StateVerifier:
 
             # Generate detailed diagnostic diff with value hashes and lengths
             diagnostic_lines = ["--- DETAILED RECOVERY MISMATCH REPORT ---"]
+            mismatch_count = 0
             for key, expected_val in definite_state.items():
                 actual_val = dump_records.get(key)
                 if actual_val != expected_val:
-                    prov = definite_prov.get(key)
-                    op_id = prov.op_id if prov else "unknown"
-                    exp_len = len(expected_val) if expected_val else 0
-                    act_len = len(actual_val) if actual_val else 0
-                    exp_hash = hash_val(expected_val)
-                    act_hash = hash_val(actual_val)
+                    mismatch_count += 1
+                    if mismatch_count <= 50:
+                        prov = definite_prov.get(key)
+                        op_id = prov.op_id if prov else "unknown"
+                        exp_len = len(expected_val) if expected_val else 0
+                        act_len = len(actual_val) if actual_val else 0
+                        exp_hash = hash_val(expected_val)
+                        act_hash = hash_val(actual_val)
 
-                    diagnostic_lines.append(
-                        f"Key: '{key}'\n"
-                        f"  Expected: length={exp_len}, sha256={exp_hash}, op_id='{op_id}'\n"
-                        f"  Actual:   length={act_len}, sha256={act_hash}"
-                    )
+                        diagnostic_lines.append(
+                            f"Key: '{key}'\n"
+                            f"  Expected: length={exp_len}, sha256={exp_hash}, op_id='{op_id}'\n"
+                            f"  Actual:   length={act_len}, sha256={act_hash}"
+                        )
+            if mismatch_count > 50:
+                diagnostic_lines.append(f"... and {mismatch_count - 50} additional mismatched keys omitted for brevity.")
             errors.append("\n".join(diagnostic_lines))
 
         passed = (len(errors) == 0)

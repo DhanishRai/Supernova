@@ -65,6 +65,20 @@ The torture tool is an adversarial testing harness designed to break our Go key-
   - Exercises all 7 mandated scenarios: Large PUT, Large overwrite, Large values across multiple keys, Large value followed by DELETE, Repeated large writes on shared keys, Kill during transmission, Kill during processing.
   - Verifies defect detection: Truncated values, corrupted bytes, incorrect hex decoding, partial persistence / torn records, and incorrect overwrites.
 
+### CP7: Large-Batch Testing (`--mode large-batches`)
+- **`worker.py` (`generate_large_batch`)**:
+  - High-performance generator creating batches up to 10,000 operations across diverse topologies: `all_put`, `all_del`, `mixed`, `repeated`, `put_then_del`, and `del_then_put`.
+  - Evaluates batch order semantics: repeated operations on identical keys within the same batch collapse to the net final sub-operation.
+- **Strict Atomicity Verification & Crash Semantics**:
+  - A batch is treated as a single indivisible logical transaction ($A$ in ACID).
+  - The Oracle mathematically enforces that a batch is either 100% applied or 0% applied. Torn/partial application is strictly flagged as an `ATOMICITY VIOLATION`.
+  - Distinguishes crashes mid-processing from crashes after durability but before ACK delivery (where the batch is validly durable on disk and accepted as `unacked_committed`).
+- **Memory & Wire Protocol Scaling**:
+  - Adaptive socket/pipe write timeouts scaled for multi-thousand item batches.
+  - Diagnostic mismatch reporting bounded to 50 entries with omission summaries to protect terminal buffers while preserving full details in artifacts.
+- **`tests/test_large_batches.py`**:
+  - Exercises all 12 large-batch scenarios and defect models: 10,000-op all-PUT, all-DEL, mixed, repeated keys, PUT-then-DEL, DEL-then-PUT, transmission crash, processing crash, post-durability pre-ACK crash, torn batch rejection, live/mock engine integration, and memory efficiency.
+
 ## Running Tests
 From `Supernova/torture tool`:
 ```bash

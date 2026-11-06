@@ -56,6 +56,88 @@ def generate_large_value(op_id: str, writer_id: str, key: str, size: int = 1024 
     return prefix + (pattern * repeats) + pattern[:tail]
 
 
+def generate_large_batch(
+    size: int,
+    key_pool: Optional[List[str]] = None,
+    rng: Optional[random.Random] = None,
+    mix_type: str = "mixed",
+    op_id: str = "batch",
+    writer_id: str = "w1",
+) -> Tuple[List[BatchSubOp], List[BatchItem]]:
+    """
+    Constructs high-volume batches containing up to 10,000 sub-operations with zero redundant memory overhead.
+    
+    Supported Workload Topologies:
+    - 'all_put': Pure batch of PUT operations on unique or pooled keys.
+    - 'all_del': Pure batch of DELETE operations on existing keys.
+    - 'mixed': Balanced interleaved sequence of PUTs and DELs.
+    - 'repeated': Dense repetitions and updates over a tiny key set (e.g. 5 keys).
+    - 'put_then_del': Sequential pairs of PUT followed immediately by DEL on same key (net: absent).
+    - 'del_then_put': Sequential pairs of DEL followed immediately by PUT on same key (net: present).
+    """
+    r = rng or random.Random(42)
+    oracle_items: List[BatchSubOp] = []
+    proto_items: List[BatchItem] = []
+
+    if mix_type == "all_put":
+        for i in range(size):
+            k = key_pool[i % len(key_pool)] if key_pool else f"batch_k_{i}"
+            v = f"val_{writer_id}_{op_id}_{i}"
+            oracle_items.append(BatchSubOp(OpType.PUT, k, v))
+            proto_items.append(BatchItem.make_put(k, v))
+
+    elif mix_type == "all_del":
+        for i in range(size):
+            k = key_pool[i % len(key_pool)] if key_pool else f"batch_k_{i}"
+            oracle_items.append(BatchSubOp(OpType.DEL, k))
+            proto_items.append(BatchItem.make_del(k))
+
+    elif mix_type == "put_then_del":
+        num_pairs = max(1, size // 2)
+        for i in range(num_pairs):
+            k = key_pool[i % len(key_pool)] if key_pool else f"ptd_k_{i}"
+            v = f"val_ptd_{i}"
+            oracle_items.append(BatchSubOp(OpType.PUT, k, v))
+            proto_items.append(BatchItem.make_put(k, v))
+            oracle_items.append(BatchSubOp(OpType.DEL, k))
+            proto_items.append(BatchItem.make_del(k))
+
+    elif mix_type == "del_then_put":
+        num_pairs = max(1, size // 2)
+        for i in range(num_pairs):
+            k = key_pool[i % len(key_pool)] if key_pool else f"dtp_k_{i}"
+            v = f"val_dtp_{i}"
+            oracle_items.append(BatchSubOp(OpType.DEL, k))
+            proto_items.append(BatchItem.make_del(k))
+            oracle_items.append(BatchSubOp(OpType.PUT, k, v))
+            proto_items.append(BatchItem.make_put(k, v))
+
+    elif mix_type == "repeated":
+        small_pool = [f"rep_k_{j}" for j in range(5)]
+        for i in range(size):
+            k = small_pool[i % 5]
+            if r.random() < 0.75:
+                v = f"rep_v_{writer_id}_{i}"
+                oracle_items.append(BatchSubOp(OpType.PUT, k, v))
+                proto_items.append(BatchItem.make_put(k, v))
+            else:
+                oracle_items.append(BatchSubOp(OpType.DEL, k))
+                proto_items.append(BatchItem.make_del(k))
+
+    else:  # "mixed"
+        for i in range(size):
+            k = key_pool[i % len(key_pool)] if key_pool else f"mix_k_{i}"
+            if r.random() < 0.60:
+                v = f"val_mix_{writer_id}_{i}"
+                oracle_items.append(BatchSubOp(OpType.PUT, k, v))
+                proto_items.append(BatchItem.make_put(k, v))
+            else:
+                oracle_items.append(BatchSubOp(OpType.DEL, k))
+                proto_items.append(BatchItem.make_del(k))
+
+    return oracle_items, proto_items
+
+
 class ConcurrentWriter:
     """
     Independent worker thread for concurrent stress testing.

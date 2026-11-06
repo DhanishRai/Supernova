@@ -455,6 +455,8 @@ class EngineClient:
         """Submits an atomic BATCH operation."""
         chosen_id = op_id or self.id_gen.next_id()
         cmd = ProtocolCodec.encode_batch(chosen_id, items)
+        if timeout is None and hasattr(items, "__len__") and len(items) > 1000:
+            timeout = max(self.default_timeout, 10.0)
         return self._send_command(chosen_id, cmd, timeout=timeout)
 
     def compact(

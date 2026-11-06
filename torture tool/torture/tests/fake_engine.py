@@ -137,52 +137,54 @@ def do_serve(db_path: str) -> int:
         cmd = parts[0].upper()
         op_id = parts[1]
 
-        # Decode entire payload to inspect triggers
-        decoded_payload = ""
+        # Decode command arguments
         k, v = "", ""
         if cmd == "PUT" and len(parts) >= 4:
             k = decode_hex(parts[2])
             v = decode_hex(parts[3])
-            decoded_payload = f"{k} {v}"
+            decoded_payload = f"{op_id} {k} {v}"
         elif cmd == "DEL" and len(parts) >= 3:
             k = decode_hex(parts[2])
-            decoded_payload = k
+            decoded_payload = f"{op_id} {k}"
         elif cmd == "BATCH" and len(parts) >= 3:
-            decoded_payload = " ".join(parts[2:])
+            decoded_payload = f"{op_id} " + " ".join(parts[2:20])
+        else:
+            decoded_payload = op_id
 
         # Triggers for unit testing
-        if "TRIGGER_STDERR:" in decoded_payload:
-            idx = decoded_payload.find("TRIGGER_STDERR:")
-            msg = decoded_payload[idx + len("TRIGGER_STDERR:"):].split()[0]
-            sys.stderr.write(f"DEBUG_LOG: {msg}\n")
-            sys.stderr.flush()
+        if "TRIGGER_" in decoded_payload:
+            if "TRIGGER_STDERR:" in decoded_payload:
+                idx = decoded_payload.find("TRIGGER_STDERR:")
+                msg = decoded_payload[idx + len("TRIGGER_STDERR:"):].split()[0]
+                sys.stderr.write(f"DEBUG_LOG: {msg}\n")
+                sys.stderr.flush()
 
-        if "TRIGGER_UNKNOWN_ID:" in decoded_payload:
-            idx = decoded_payload.find("TRIGGER_UNKNOWN_ID:")
-            ghost_id = decoded_payload[idx + len("TRIGGER_UNKNOWN_ID:"):].split()[0]
-            sys.stdout.write(f"ACK {ghost_id}\n")
-            sys.stdout.flush()
+            if "TRIGGER_UNKNOWN_ID:" in decoded_payload:
+                idx = decoded_payload.find("TRIGGER_UNKNOWN_ID:")
+                ghost_id = decoded_payload[idx + len("TRIGGER_UNKNOWN_ID:"):].split()[0]
+                sys.stdout.write(f"ACK {ghost_id}\n")
+                sys.stdout.flush()
 
-        if "TRIGGER_MALFORMED" in decoded_payload:
-            sys.stdout.write("CORRUPTED_LINE_NOT_A_VALID_ACK_OR_ERR\n")
-            sys.stdout.flush()
+            if "TRIGGER_MALFORMED" in decoded_payload:
+                sys.stdout.write("CORRUPTED_LINE_NOT_A_VALID_ACK_OR_ERR\n")
+                sys.stdout.flush()
 
-        if "TRIGGER_DELAY:" in decoded_payload:
-            idx = decoded_payload.find("TRIGGER_DELAY:")
-            sec = float(decoded_payload[idx + len("TRIGGER_DELAY:"):].split()[0])
-            time.sleep(sec)
+            if "TRIGGER_DELAY:" in decoded_payload:
+                idx = decoded_payload.find("TRIGGER_DELAY:")
+                sec = float(decoded_payload[idx + len("TRIGGER_DELAY:"):].split()[0])
+                time.sleep(sec)
 
-        if "TRIGGER_CRASH" in decoded_payload:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(137)
+            if "TRIGGER_CRASH" in decoded_payload and "TRIGGER_CRASH_AFTER_SYNC" not in decoded_payload:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(137)
 
-        if "TRIGGER_ERR:" in decoded_payload:
-            idx = decoded_payload.find("TRIGGER_ERR:")
-            err_msg = decoded_payload[idx + len("TRIGGER_ERR:"):].split()[0]
-            sys.stdout.write(f"ERR {op_id} {err_msg}\n")
-            sys.stdout.flush()
-            continue
+            if "TRIGGER_ERR:" in decoded_payload:
+                idx = decoded_payload.find("TRIGGER_ERR:")
+                err_msg = decoded_payload[idx + len("TRIGGER_ERR:"):].split()[0]
+                sys.stdout.write(f"ERR {op_id} {err_msg}\n")
+                sys.stdout.flush()
+                continue
 
         # Normal execution
         if cmd == "PUT":
@@ -197,17 +199,27 @@ def do_serve(db_path: str) -> int:
             items = []
             for item in parts[2:]:
                 if item.startswith("P:"):
-                    subparts = item.split(":")
+                    subparts = item.split(":", 2)
                     if len(subparts) == 3:
                         items.append({"type": "PUT", "k": decode_hex(subparts[1]), "v": decode_hex(subparts[2])})
                 elif item.startswith("D:"):
-                    subparts = item.split(":")
+                    subparts = item.split(":", 1)
                     if len(subparts) == 2:
                         items.append({"type": "DEL", "k": decode_hex(subparts[1])})
+
+            if "TRIGGER_TORN_BATCH" in raw_line:
+                # Deliberate sabotage: persist only the first half of batch items
+                items = items[: len(items) // 2]
 
             wal_file.write(json.dumps({"type": "BATCH", "items": items}) + "\n")
             wal_file.flush()
             os.fsync(wal_file.fileno())
+
+            if "TRIGGER_CRASH_AFTER_SYNC" in raw_line:
+                wal_file.close()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(137)
 
         # Send ACK
         sys.stdout.write(f"ACK {op_id}\n")

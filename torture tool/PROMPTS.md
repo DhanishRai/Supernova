@@ -863,3 +863,70 @@ test large values
 STOP after CP6.
 ```
 
+
+---
+
+### Entry 9
+- **AI Tool**: Antigravity (Powered by Gemini 3.8 Flash)
+- **Approximate Date/Time**: 2026-11-06 16:01:00 IST
+- **Development Stage**: CP7 (Large-Batch Testing)
+- **Prompt**:
+```text
+IMPORTANT LOCATION:
+
+All my work must be inside:
+
+Supernova/torture tool/
+
+Implement CP7: large-batch testing.
+
+Add:
+
+--mode large-batches
+
+OBJECTIVE:
+
+Support batches containing up to 10,000 operations.
+
+TEST:
+
+1. All-PUT batch.
+2. All-DELETE batch.
+3. Mixed batch.
+4. Repeated keys.
+5. PUT followed by DELETE.
+6. DELETE followed by PUT.
+7. Crash during batch transmission.
+8. Crash during batch processing.
+9. Crash after durability but before ACK delivery.
+
+CRITICAL:
+
+A batch is one logical operation.
+
+Never allow the oracle to accept partial batch application.
+
+Handle repeated keys according to documented batch order.
+
+MEMORY:
+
+Keep memory usage reasonable.
+
+Avoid unnecessary copies.
+
+Do not print all 10,000 operations unless a failure occurs.
+
+TEST:
+
+Use fake-process tests for protocol and oracle correctness.
+
+Use the real engine for actual batch atomicity testing.
+
+GIT COMMIT:
+
+test large batches
+
+STOP after CP7.
+```
+
+
