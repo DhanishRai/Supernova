@@ -1,0 +1,39 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary, output, and coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Output of the go coverage tool
+*.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories (remove the rule if using vendored dependencies)
+vendor/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local database files generated during runs/testing
+*.db
+*.data
+*.log
