@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import itertools
 import os
+import sys
 import re
 import signal
 import subprocess
@@ -269,7 +270,15 @@ class EngineClient:
     def is_alive(self) -> bool:
         if self._proc is None:
             return False
-        return self._proc.poll() is None
+        if self._proc.poll() is not None:
+            return False
+        if self._eof_reached.is_set():
+            try:
+                self._proc.wait(timeout=0.5)
+            except Exception:
+                pass
+            return self._proc.poll() is None
+        return True
 
     def start(self) -> None:
         """
@@ -280,7 +289,22 @@ class EngineClient:
         if self.is_alive:
             raise EngineProcessError("Engine process is already running")
 
-        cmd = [self.engine_bin, "serve", self.db_path]
+        real_bin = self.engine_bin
+        if os.path.isfile(real_bin) and not real_bin.endswith(".exe"):
+            try:
+                with open(real_bin, "r", encoding="utf-8", errors="ignore") as f:
+                    first_line = f.readline().strip()
+                if first_line.endswith(".py"):
+                    real_bin = os.path.normpath(os.path.join(os.path.dirname(real_bin), first_line))
+            except Exception:
+                pass
+
+        if real_bin.endswith(".py"):
+            cmd = [sys.executable, real_bin, "serve", self.db_path]
+        elif sys.platform == "win32" and not real_bin.endswith(".exe") and os.path.isfile(real_bin + ".exe"):
+            cmd = [real_bin + ".exe", "serve", self.db_path]
+        else:
+            cmd = [real_bin, "serve", self.db_path]
         if self.max_bytes is not None:
             cmd.extend(["--max-bytes", str(self.max_bytes)])
         try:

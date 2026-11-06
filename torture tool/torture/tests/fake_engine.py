@@ -126,6 +126,27 @@ def do_dump(db_path: str) -> int:
     return 0
 
 
+def do_get(db_path: str, key: str) -> int:
+    """Gets value for key or NOTFOUND."""
+    data = get_data_path(db_path)
+    state = {}
+    if os.path.exists(data):
+        try:
+            with open(data, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+
+    if key in state:
+        sys.stdout.write(f"{state[key]}\n")
+        sys.stdout.flush()
+        return 0
+    else:
+        sys.stdout.write("NOTFOUND\n")
+        sys.stdout.flush()
+        return 1
+
+
 def do_serve(db_path: str, max_bytes: Optional[int] = None) -> int:
     wal_path = get_wal_path(db_path)
     wal_file = open(wal_path, "a", encoding="utf-8")
@@ -404,6 +425,11 @@ def main() -> int:
         return do_check(path)
     elif subcmd == "dump":
         return do_dump(path)
+    elif subcmd == "get":
+        if len(sys.argv) < 4:
+            sys.stderr.write(f"Usage: {sys.argv[0]} get <path> <key>\n")
+            return 1
+        return do_get(path, sys.argv[3])
     else:
         sys.stderr.write(f"Unknown subcommand '{subcmd}'\n")
         return 1

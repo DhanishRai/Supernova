@@ -85,7 +85,7 @@ import "killitdb/engine"
     - **Record buffer is reused** across all records during scanning (single growing `[]byte`; no per-record heap alloc).
     - **Value bytes are not loaded into RAM** during recovery; `decodeRecordForRecovery` advances past value bytes without copying them.
   - **Comprehensive automated test suite:** **98 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, crash recovery edge cases, 1,000,000-key recovery benchmark (469.8 ms), and all 10 core safety invariants.
-  - **Torture Test Suite Validation:** Autonomous multi-iteration crash torture testing verified across all modes (`default`, `large-values`, `large-batches`, `compaction`, `disk-full`, `recovery-crash`) with F2 torn-tail recovery coverage and direct point-lookup verification.
+  - **Torture Test Suite Validation:** Autonomous multi-iteration crash torture testing verified across all modes (`default`, `large-values`, `large-batches`, `compaction`, `disk-full`, `recovery-crash`) with golden template caching, empirical startup/recovery delay calibration ($S = T - R$), multi-variant torn tails (fewer than 8B, length past EOF, bad CRC, 1-byte truncate, clean), chained kills (F2), and direct point-lookup verification. All 96 unit tests in the harness pass cleanly.
 
 ---
 

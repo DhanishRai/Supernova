@@ -132,7 +132,8 @@ class CrashTestRunner:
 
         seeder_client.close()
         t_seed_dur = time.perf_counter() - t_seed_start
-        golden_size_kb = os.path.getsize(golden_db) / 1024.0
+        golden_file = golden_db if os.path.exists(golden_db) else (golden_db + ".data" if os.path.exists(golden_db + ".data") else golden_db)
+        golden_size_kb = (os.path.getsize(golden_file) if os.path.exists(golden_file) else 0) / 1024.0
         print(f"Seeding completed in {t_seed_dur:.3f}s: 10,000 ops, {golden_size_kb:.1f} KB on disk.")
 
         # -------------------------------------------------------------
@@ -144,8 +145,9 @@ class CrashTestRunner:
 
         for _ in range(5):
             t0 = time.perf_counter()
+            calib_cmd = [sys.executable, self.config.engine_bin, "open", golden_db] if self.config.engine_bin.endswith(".py") else [self.config.engine_bin, "open", golden_db]
             p = subprocess.run(
-                [self.config.engine_bin, "open", golden_db],
+                calib_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -170,8 +172,8 @@ class CrashTestRunner:
                         pass
             calib_recovery_times.append(rec_sec)
 
-        median_total = statistics.median(calib_total_times)
-        median_recovery = statistics.median(calib_recovery_times)
+        median_total = statistics.median(calib_total_times) if calib_total_times else 0.010
+        median_recovery = statistics.median(calib_recovery_times) if calib_recovery_times else 0.002
         median_startup = max(0.001, median_total - median_recovery)
         print(
             f"Calibration: Median Startup={median_startup*1000:.2f}ms, "
@@ -205,7 +207,14 @@ class CrashTestRunner:
             iter_seed = self.master_rng.randint(1, 100_000_000)
             iter_rng = random.Random(iter_seed)
 
-            shutil.copyfile(golden_db, db_path)
+            # Copy golden database and sidecars
+            if os.path.exists(golden_db):
+                shutil.copyfile(golden_db, db_path)
+            if os.path.exists(golden_db + ".data"):
+                shutil.copyfile(golden_db + ".data", db_path + ".data")
+            if os.path.exists(golden_db + ".wal"):
+                shutil.copyfile(golden_db + ".wal", db_path + ".wal")
+
             oracle = DatabaseOracle()
             with golden_oracle._lock:
                 oracle._seq_counter = golden_oracle._seq_counter
@@ -220,57 +229,75 @@ class CrashTestRunner:
                 "clean",
             ])
 
-            curr_size = os.path.getsize(db_path)
+            target_data_file = db_path if os.path.exists(db_path) else db_path + ".data"
+            curr_size = os.path.getsize(target_data_file) if os.path.exists(target_data_file) else 0
+
             if variant == "fewer_than_8":
-                with open(db_path, "ab") as f:
+                with open(target_data_file, "ab") as f:
                     f.write(bytes([iter_rng.randint(1, 255) for _ in range(iter_rng.randint(1, 7))]))
             elif variant == "length_past_eof":
-                with open(db_path, "ab") as f:
+                with open(target_data_file, "ab") as f:
                     f.write(struct.pack(">I", 50000) + b"\xde\xad\xbe\xef" + b"incomplete_tail")
             elif variant == "bad_crc":
                 payload = b"\x00\x00\x00\x01\x01\x00\x06\x00\x00\x00\x06foobartest"
-                with open(db_path, "ab") as f:
+                with open(target_data_file, "ab") as f:
                     f.write(struct.pack(">II", len(payload), 0xBAD0DEAD) + payload)
             elif variant == "cut_by_1_byte_f4":
                 if curr_size > 16:
-                    with open(db_path, "r+b") as f:
+                    with open(target_data_file, "r+b") as f:
                         f.truncate(curr_size - 1)
 
             num_chain_kills = iter_rng.randint(1, 3)
             chain_success = True
             last_phase = "before truncate (scan active)"
             last_delay_ms = 0.0
+            last_exit_status = 0
+            rec_start_time = time.time()
+            rec_comp_time = time.time()
 
             for chain_step in range(num_chain_kills):
-                size_before = os.path.getsize(db_path)
+                size_before = os.path.getsize(target_data_file) if os.path.exists(target_data_file) else 0
+                open_cmd = [sys.executable, self.config.engine_bin, "open", db_path] if self.config.engine_bin.endswith(".py") else [self.config.engine_bin, "open", db_path]
+                rec_start_time = time.time()
                 open_proc = subprocess.Popen(
-                    [self.config.engine_bin, "open", db_path],
+                    open_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                 )
 
-                scan_started = False
-                try:
-                    line = open_proc.stderr.readline()
-                    if "RECOVERY_SCAN_START" in line:
-                        scan_started = True
-                except Exception:
-                    pass
-
-                if scan_started:
-                    delay_ms = iter_rng.uniform(0.5, max(1.5, median_recovery * 1000 * 0.75))
-                else:
+                # Check if custom min/max delay was explicitly requested by test/user
+                has_custom_delay = (self.config.min_kill_delay_ms != 1 or self.config.max_kill_delay_ms != 50)
+                if has_custom_delay:
                     delay_ms = iter_rng.uniform(
-                        median_startup * 1000,
-                        (median_startup + median_recovery * 0.75) * 1000,
+                        self.config.min_kill_delay_ms,
+                        self.config.max_kill_delay_ms,
                     )
+                else:
+                    scan_started = False
+                    try:
+                        line = open_proc.stderr.readline()
+                        if "RECOVERY_SCAN_START" in line:
+                            scan_started = True
+                    except Exception:
+                        pass
+
+                    if scan_started:
+                        delay_ms = iter_rng.uniform(0.5, max(1.5, median_recovery * 1000 * 0.75))
+                    else:
+                        delay_ms = iter_rng.uniform(
+                            median_startup * 1000,
+                            (median_startup + median_recovery * 0.75) * 1000,
+                        )
+
                 last_delay_ms = delay_ms
                 time.sleep(delay_ms / 1000.0)
 
                 poll_ret = open_proc.poll()
                 if poll_ret is not None:
                     chain_success = False
+                    last_exit_status = poll_ret
+                    rec_comp_time = time.time()
                     break
 
                 try:
@@ -287,10 +314,22 @@ class CrashTestRunner:
                     open_proc.kill()
                     open_proc.wait()
 
+                rec_comp_time = time.time()
+                last_exit_status = open_proc.returncode
+
                 open_stdout = ""
                 if open_proc.stdout:
                     try:
                         open_stdout = open_proc.stdout.read()
+                    except Exception:
+                        pass
+                    try:
+                        open_proc.stdout.close()
+                    except Exception:
+                        pass
+                if open_proc.stderr:
+                    try:
+                        open_proc.stderr.close()
                     except Exception:
                         pass
 
@@ -298,7 +337,7 @@ class CrashTestRunner:
                     chain_success = False
                     break
 
-                size_after = os.path.getsize(db_path)
+                size_after = os.path.getsize(target_data_file) if os.path.exists(target_data_file) else 0
                 if size_after < size_before:
                     last_phase = "after truncate (repair started)"
                 else:
@@ -306,12 +345,31 @@ class CrashTestRunner:
 
             if not chain_success:
                 missed_count += 1
-                sys.stdout.write(
-                    f"[{passed_count:03d}/{target_successes:03d}] MISSED CRASH WINDOW "
-                    f"attempts={attempt} missed={missed_count} delay={last_delay_ms:.2f}ms tail={variant} "
-                    f"({time.perf_counter() - t_iter_start:.3f}s)\n"
+                rec_info = RecoveryCrashInfo(
+                    recovery_start_time=rec_start_time,
+                    requested_kill_delay_ms=last_delay_ms,
+                    actual_exit_status=last_exit_status,
+                    sigkill_occurred=False,
+                    recovery_completion_time=rec_comp_time,
+                    missed_crash_window=True,
+                    second_recovery_success=False,
+                    second_recovery_time_s=0.0,
                 )
-                sys.stdout.flush()
+                rep = IterationReport(
+                    iteration=attempt,
+                    total_iterations=target_successes,
+                    passed=False,
+                    delay_ms=int(last_delay_ms),
+                    submitted=10000,
+                    acked=10000,
+                    recovered_keys=0,
+                    duration_s=time.perf_counter() - t_iter_start,
+                    violations=["MISSED CRASH WINDOW"],
+                    mode="recovery-crash",
+                    missed_crash_window=True,
+                    recovery_info=rec_info,
+                )
+                self.reporter.print_iteration_summary(rep)
                 continue
 
             verifier = StateVerifier(
@@ -319,29 +377,74 @@ class CrashTestRunner:
                 db_path=db_path,
                 timeout=5.0,
             )
+            t_v_start = time.perf_counter()
             passed, violations, actual_dump = verifier.verify(oracle)
+            t_verify_dur = time.perf_counter() - t_v_start
             t_iter_dur = time.perf_counter() - t_iter_start
 
+            rec_info = RecoveryCrashInfo(
+                recovery_start_time=rec_start_time,
+                requested_kill_delay_ms=last_delay_ms,
+                actual_exit_status=last_exit_status,
+                sigkill_occurred=True,
+                recovery_completion_time=rec_comp_time,
+                missed_crash_window=False,
+                second_recovery_success=passed,
+                second_recovery_time_s=t_verify_dur,
+            )
+
+            rep = IterationReport(
+                iteration=passed_count + 1,
+                total_iterations=target_successes,
+                passed=passed,
+                delay_ms=int(last_delay_ms),
+                submitted=10000,
+                acked=10000,
+                recovered_keys=len(actual_dump),
+                duration_s=t_iter_dur,
+                violations=violations,
+                mode="recovery-crash",
+                missed_crash_window=False,
+                recovery_info=rec_info,
+            )
+            self.reporter.print_iteration_summary(rep)
+
             if not passed:
+                child_exit = ChildProcessExitInfo(
+                    pid=open_proc.pid if open_proc else None,
+                    returncode=last_exit_status,
+                    is_alive=False,
+                    killed_by_sigkill=True,
+                    termination_cause=f"Exit code {last_exit_status}",
+                )
+                details = FailureDetails(
+                    category=FailureCategory.RECOVERY_FAILURE,
+                    iteration=attempt,
+                    total_iterations=target_successes,
+                    seed=self.config.seed,
+                    derived_seed=iter_seed,
+                    mode=self.config.mode.value,
+                    db_path=db_path,
+                    errors=violations,
+                    child_exit=child_exit,
+                    actual_dump=actual_dump,
+                    recovery_info=rec_info,
+                )
+                art_dir = self.reporter.preserve_failure_artifacts(details, oracle=oracle)
                 sys.stderr.write(f"\n[FAIL] Attempt {attempt} failed verification: {violations}\n")
+                sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
                 return 1
 
             passed_count += 1
             phase_counts[last_phase] += 1
             variant_counts[variant] += 1
 
-            sys.stdout.write(
-                f"[{passed_count:03d}/{target_successes:03d}] attempts={attempt} missed={missed_count} "
-                f"delay={last_delay_ms:.2f}ms phase='{last_phase}' chain={num_chain_kills} tail={variant} "
-                f"check=OK dump=oracle-match ({t_iter_dur:.3f}s)\n"
-            )
-            sys.stdout.flush()
-
-        if os.path.exists(golden_db):
-            try:
-                os.remove(golden_db)
-            except Exception:
-                pass
+        for p in [golden_db, golden_db + ".data", golden_db + ".wal"]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
         print("=" * 65)
         if passed_count >= target_successes:

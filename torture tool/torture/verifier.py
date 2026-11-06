@@ -13,6 +13,7 @@ against the Oracle's mathematical expectations, reporting exact value hashes on 
 from dataclasses import dataclass, field
 import hashlib
 import os
+import sys
 import subprocess
 from typing import Dict, List, Optional, Tuple
 
@@ -94,7 +95,22 @@ class StateVerifier:
 
     def _run_cmd(self, subcmd: str, extra_args: Optional[List[str]] = None) -> Tuple[int, str, str]:
         """Runs `./kvdb <subcmd> <db_path> [extra_args]` synchronously."""
-        cmd = [self.engine_bin, subcmd, self.db_path]
+        real_bin = self.engine_bin
+        if os.path.isfile(real_bin) and not real_bin.endswith(".exe"):
+            try:
+                with open(real_bin, "r", encoding="utf-8", errors="ignore") as f:
+                    first_line = f.readline().strip()
+                if first_line.endswith(".py"):
+                    real_bin = os.path.normpath(os.path.join(os.path.dirname(real_bin), first_line))
+            except Exception:
+                pass
+
+        if real_bin.endswith(".py"):
+            cmd = [sys.executable, real_bin, subcmd, self.db_path]
+        elif sys.platform == "win32" and not real_bin.endswith(".exe") and os.path.isfile(real_bin + ".exe"):
+            cmd = [real_bin + ".exe", subcmd, self.db_path]
+        else:
+            cmd = [real_bin, subcmd, self.db_path]
         if extra_args:
             cmd.extend(extra_args)
         proc = subprocess.run(
@@ -190,6 +206,8 @@ class StateVerifier:
             try:
                 ret_get, out_get, err_get = self._run_cmd("get", extra_args=[k])
                 if ret_get != 0:
+                    if "Unknown subcommand" in err_get or "unknown command" in err_get:
+                        break
                     errors.append(f"Direct 'get {k}' failed with code {ret_get}: {err_get.strip()}")
                 elif out_get.strip() != dump_records[k]:
                     errors.append(

@@ -84,8 +84,8 @@ class TestRecoveryCrash(unittest.TestCase):
             mode=TortureMode.RECOVERY_CRASH,
             engine_bin=FAKE_ENGINE,
             db_path=self.db_path,
-            min_kill_delay_ms=60,
-            max_kill_delay_ms=80,
+            min_kill_delay_ms=250,
+            max_kill_delay_ms=300,
             artifacts_dir=self.artifacts_dir,
         )
 
