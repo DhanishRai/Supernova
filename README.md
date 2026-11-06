@@ -84,7 +84,8 @@ import "killitdb/engine"
     - `Open()` delegates entirely to `recoverDatabase()` for a consistent startup path whether the file is new or existing.
     - **Record buffer is reused** across all records during scanning (single growing `[]byte`; no per-record heap alloc).
     - **Value bytes are not loaded into RAM** during recovery; `decodeRecordForRecovery` advances past value bytes without copying them.
-  - **Comprehensive automated test suite:** **94 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, recovery edge cases, 1,000,000-key recovery benchmark, and all 10 core safety invariants.
+  - **Comprehensive automated test suite:** **98 tests** covering record serialization, indexing, file lifecycle, fault injection, atomic batches, concurrency, crash recovery edge cases, 1,000,000-key recovery benchmark (469.8 ms), and all 10 core safety invariants.
+  - **Torture Test Suite Validation:** Autonomous multi-iteration crash torture testing verified across all modes (`default`, `large-values`, `large-batches`, `compaction`, `disk-full`, `recovery-crash`) with F2 torn-tail recovery coverage and direct point-lookup verification.
 
 ---
 
