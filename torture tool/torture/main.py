@@ -17,7 +17,7 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from torture.config import parse_args, TortureMode
+from torture.config import parse_args, TortureMode, TortureConfig
 from torture.runner import CrashTestRunner
 
 
@@ -29,6 +29,48 @@ def main(args=None) -> int:
     except Exception as exc:
         sys.stderr.write(f"Configuration Error: {exc}\n")
         return 1
+
+    # Auto-resolve engine binary candidates (prioritizing Windows .exe and repository root)
+    repo_root = os.path.dirname(PARENT_DIR)
+    resolved_bin = None
+
+    if sys.platform == "win32":
+        candidates = [
+            config.engine_bin if config.engine_bin.endswith(".exe") else None,
+            config.engine_bin + ".exe",
+            os.path.join(repo_root, "kvdb.exe"),
+            os.path.join(PARENT_DIR, "kvdb.exe"),
+            os.path.join(repo_root, config.engine_bin if config.engine_bin.endswith(".exe") else config.engine_bin + ".exe"),
+            config.engine_bin,
+        ]
+    else:
+        candidates = [
+            config.engine_bin,
+            os.path.join(repo_root, "kvdb"),
+            os.path.join(repo_root, config.engine_bin),
+            os.path.join(PARENT_DIR, "kvdb"),
+        ]
+
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            resolved_bin = os.path.abspath(cand)
+            break
+
+    if resolved_bin:
+        config = TortureConfig(
+            iterations=config.iterations,
+            seed=config.seed,
+            mode=config.mode,
+            seed_generated=config.seed_generated,
+            engine_bin=resolved_bin,
+            db_path=config.db_path,
+            oracle_path=config.oracle_path,
+            workers=config.workers,
+            max_bytes=config.max_bytes,
+            min_kill_delay_ms=config.min_kill_delay_ms,
+            max_kill_delay_ms=config.max_kill_delay_ms,
+            artifacts_dir=config.artifacts_dir,
+        )
 
     # Check if target engine binary is available
     if not os.path.exists(config.engine_bin):

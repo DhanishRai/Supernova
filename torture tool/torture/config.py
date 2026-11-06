@@ -118,6 +118,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--engine-bin",
+        "--engine",
         type=str,
         default="./kvdb",
         help="Path to compiled engine executable (default: ./kvdb)",

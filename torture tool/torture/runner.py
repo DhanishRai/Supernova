@@ -134,44 +134,51 @@ class CrashTestRunner:
                     sys.stderr.write(f"Artifacts preserved in: {art_dir}\n")
                     return 1
 
-                # 3. Create a database with acknowledged operations (sufficiently large)
-                num_seed_ops = 50
+                # 3. Create a database with acknowledged operations (Give recovery REAL work)
+                num_seed_ops = 250
                 for op_idx in range(1, num_seed_ops + 1):
                     op_id = f"rc-seed-{op_idx}"
                     coin = iter_rng.random()
-                    k = f"key_{iter_rng.randint(1, 20):04d}"
-                    if coin < 0.6:
-                        # PUT
-                        v = f"val_{op_idx}_{iter_rng.randint(1000, 9999)}"
+                    k = f"key_{iter_rng.randint(1, 40):04d}"
+                    if coin < 0.5:
+                        # PUT with varying value sizes (up to 2KB to create real recovery work)
+                        v_len = iter_rng.choice([32, 128, 512, 1024, 2048])
+                        v = f"val_{op_idx}_" + ("v" * (v_len - min(v_len, 20)))
                         oracle.record_put(op_id, k, v, writer_id="rc-seeder")
                         client.put(k, v, op_id=op_id)
-                    elif coin < 0.8:
+                    elif coin < 0.7:
                         # DEL
                         oracle.record_del(op_id, k, writer_id="rc-seeder")
                         client.delete(k, op_id=op_id)
                     else:
-                        # BATCH
-                        sub_k1 = f"key_{iter_rng.randint(1, 20):04d}"
-                        sub_v1 = f"val_{op_idx}_b1_{iter_rng.randint(1000, 9999)}"
-                        sub_k2 = f"key_{iter_rng.randint(1, 20):04d}"
-                        batch_items = [
-                            BatchItem.make_put(sub_k1, sub_v1),
-                            BatchItem.make_del(sub_k2),
-                        ]
-                        oracle.record_batch(
-                            op_id,
-                            [
-                                BatchSubOp(op_type=OpType.PUT, key=sub_k1, value=sub_v1),
-                                BatchSubOp(op_type=OpType.DEL, key=sub_k2),
-                            ],
-                            writer_id="rc-seeder",
-                        )
+                        # Multi-operation BATCH
+                        batch_size = iter_rng.randint(3, 6)
+                        batch_items = []
+                        oracle_items = []
+                        for b_idx in range(batch_size):
+                            sub_k = f"key_{iter_rng.randint(1, 40):04d}"
+                            if iter_rng.random() < 0.7:
+                                sub_v = f"batch_{op_idx}_{b_idx}_val"
+                                batch_items.append(BatchItem.make_put(sub_k, sub_v))
+                                oracle_items.append(BatchSubOp(op_type=OpType.PUT, key=sub_k, value=sub_v))
+                            else:
+                                batch_items.append(BatchItem.make_del(sub_k))
+                                oracle_items.append(BatchSubOp(op_type=OpType.DEL, key=sub_k))
+                        oracle.record_batch(op_id, oracle_items, writer_id="rc-seeder")
                         client.batch(batch_items, op_id=op_id)
 
                 # 4. Kill the serve process
                 client.kill(signal.SIGKILL)
                 client.close()
                 client = None
+
+                # Cover F2 (in-flight crash / torn record tail):
+                # In 50% of iterations, inject an uncommitted torn record frame at the log tail
+                has_f2_damage = (iter_rng.random() < 0.5)
+                if has_f2_damage and os.path.exists(db_path):
+                    with open(db_path, "ab") as f:
+                        # Write incomplete record framing (4-byte length + incomplete CRC)
+                        f.write(b"\x00\x00\x00\x40\xaa\xbb")
 
                 # 5. Start kvdb open (1st recovery)
                 recovery_start_time = time.time()
@@ -182,11 +189,9 @@ class CrashTestRunner:
                     text=True,
                 )
 
-                # 6. Select a random millisecond delay
-                delay_ms = iter_rng.uniform(
-                    self.config.min_kill_delay_ms,
-                    self.config.max_kill_delay_ms,
-                )
+                # 6. Calibrate kill delay to land inside the actual recovery window
+                # Recovery of 250 operations takes ~2-6ms. Calibrate delay to 0.5 - 3.5ms.
+                delay_ms = iter_rng.uniform(0.5, 3.5)
                 time.sleep(delay_ms / 1000.0)
 
                 # 7. Kill the open process using SIGKILL
@@ -212,7 +217,22 @@ class CrashTestRunner:
                         open_proc.wait()
                     recovery_completion_time = time.time()
                     actual_exit_status = open_proc.returncode
-                    sigkill_occurred = (actual_exit_status in (-signal.SIGKILL, 137, 9))
+
+                    # Read stdout from open_proc to verify it didn't complete prior to kill
+                    open_stdout = ""
+                    if open_proc.stdout:
+                        try:
+                            open_stdout = open_proc.stdout.read()
+                        except Exception:
+                            pass
+
+                    # Confirm kill landed on recovery:
+                    # If open completed normally, it outputs "recovery=" and exit code 0.
+                    # If killed mid-recovery, exit code is non-zero and stdout did not finish.
+                    completed_normally = (actual_exit_status == 0) or ("recovery=" in open_stdout)
+                    sigkill_occurred = not completed_normally and (
+                        actual_exit_status in (-signal.SIGKILL, 137, 9) or (sys.platform == 'win32' and actual_exit_status != 0)
+                    )
                     missed_crash_window = not sigkill_occurred
 
                 # Safely close first open process pipes

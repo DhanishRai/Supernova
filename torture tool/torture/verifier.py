@@ -92,9 +92,11 @@ class StateVerifier:
         self.db_path = db_path
         self.timeout = timeout
 
-    def _run_cmd(self, subcmd: str) -> Tuple[int, str, str]:
-        """Runs `./kvdb <subcmd> <db_path>` synchronously."""
+    def _run_cmd(self, subcmd: str, extra_args: Optional[List[str]] = None) -> Tuple[int, str, str]:
+        """Runs `./kvdb <subcmd> <db_path> [extra_args]` synchronously."""
         cmd = [self.engine_bin, subcmd, self.db_path]
+        if extra_args:
+            cmd.extend(extra_args)
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -180,6 +182,22 @@ class StateVerifier:
             if mismatch_count > 50:
                 diagnostic_lines.append(f"... and {mismatch_count - 50} additional mismatched keys omitted for brevity.")
             errors.append("\n".join(diagnostic_lines))
+
+        # 5. Direct Point-Lookup verification (GET):
+        # Verify that ReadAt on disk returns exact value for recovered keys
+        sample_keys = list(dump_records.keys())[:25]
+        for k in sample_keys:
+            try:
+                ret_get, out_get, err_get = self._run_cmd("get", extra_args=[k])
+                if ret_get != 0:
+                    errors.append(f"Direct 'get {k}' failed with code {ret_get}: {err_get.strip()}")
+                elif out_get.strip() != dump_records[k]:
+                    errors.append(
+                        f"Direct 'get {k}' value mismatch: dump had '{dump_records[k]}', "
+                        f"but 'get' returned '{out_get.strip()}'"
+                    )
+            except Exception as exc:
+                errors.append(f"Failed to execute 'get {k}': {exc}")
 
         passed = (len(errors) == 0)
         return passed, errors, dump_records
