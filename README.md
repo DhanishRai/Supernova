@@ -432,6 +432,75 @@ rm -f ./my_test.db* ./test_batch.db* ./demo.db*
 
 ---
 
+### 4. Comprehensive Torture Tool Execution Cheat Sheet
+
+Judges can execute the autonomous crash torture testing tool across any workload, iteration count, concurrency level, or test mode directly in **Git Bash** (or Windows PowerShell):
+
+#### A. Standard Hackathon Run (Default 500 Iterations)
+```bash
+PYTHONPATH="torture tool" python -m torture --engine-bin ./kvdb.exe
+```
+
+#### B. Quick Verification Runs (Custom Iteration Counts)
+```bash
+# 10 iterations (~2 seconds)
+PYTHONPATH="torture tool" python -m torture --iterations 10 --engine-bin ./kvdb.exe
+
+# 50 iterations (~10 seconds)
+PYTHONPATH="torture tool" python -m torture --iterations 50 --engine-bin ./kvdb.exe
+
+# 100 iterations (~20 seconds)
+PYTHONPATH="torture tool" python -m torture --iterations 100 --engine-bin ./kvdb.exe
+
+# 200 iterations (~40 seconds)
+PYTHONPATH="torture tool" python -m torture --iterations 200 --engine-bin ./kvdb.exe
+```
+
+#### C. Reproducible Deterministic Runs (`--seed <N>`)
+```bash
+PYTHONPATH="torture tool" python -m torture --iterations 50 --seed 12345 --engine-bin ./kvdb.exe
+```
+
+#### D. All Specialized Torture Modes (`--mode <name>`)
+```bash
+# 1. Large Values Mode (1 MB payloads with mid-flight kills)
+PYTHONPATH="torture tool" python -m torture --mode large-values --iterations 20 --engine-bin ./kvdb.exe
+
+# 2. Large Batches Mode (Up to 10,000 operations per batch)
+PYTHONPATH="torture tool" python -m torture --mode large-batches --iterations 20 --engine-bin ./kvdb.exe
+
+# 3. Recovery-Crash Mode (Killing the engine mid-recovery with torn tails & chained F2 kills)
+PYTHONPATH="torture tool" python -m torture --mode recovery-crash --iterations 10 --engine-bin ./kvdb.exe
+
+# 4. Compaction-Crash Mode (Injecting SIGKILL during active compaction)
+PYTHONPATH="torture tool" python -m torture --mode compaction --iterations 20 --engine-bin ./kvdb.exe
+
+# 5. Disk-Full Mode (Organic capacity filling, E2 midway batch, E4 compact, E5 resume)
+PYTHONPATH="torture tool" python -m torture --mode disk-full --iterations 20 --engine-bin ./kvdb.exe --max-bytes 50000
+```
+
+#### E. Multi-Writer Concurrency Testing (`--workers <N>`)
+```bash
+# 2 Concurrent writer threads
+PYTHONPATH="torture tool" python -m torture --workers 2 --iterations 50 --engine-bin ./kvdb.exe
+
+# 4 Concurrent writer threads
+PYTHONPATH="torture tool" python -m torture --workers 4 --iterations 50 --engine-bin ./kvdb.exe
+```
+
+#### F. Tuning Flags Reference
+| Flag | Example | Description |
+|---|---|---|
+| `--min-kill-delay-ms` | `--min-kill-delay-ms 5` | Minimum millisecond delay before delivering SIGKILL. |
+| `--max-kill-delay-ms` | `--max-kill-delay-ms 35` | Maximum millisecond delay before delivering SIGKILL. |
+| `--key-pool-size` | `--key-pool-size 2000` | Number of distinct keys rotated during the workload. |
+| `--max-bytes` | `--max-bytes 100000` | Storage capacity limit in bytes (for disk-full mode). |
+| `--artifacts-dir` | `--artifacts-dir ./my_artifacts` | Directory where diagnostic crash artifacts are saved if a failure occurs. |
+
+*(Note: For Windows PowerShell, prefix with `$env:PYTHONPATH = "torture tool"; python -m torture ...`).*
+
+---
+
 ## How to Run Tests
 
 Run the full standard test suite:
