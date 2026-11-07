@@ -303,6 +303,133 @@ This guide provides the exact commands for judges to verify every crash-safety g
 | **Reproducible random seeds** | `PYTHONPATH="torture tool" python -m torture --seed 12345 --iterations 10 --engine-bin ./kvdb.exe` | Uses `random.Random(seed)` with derived per-iteration seeds; every run with `--seed <N>` executes the exact same schedule and workload. |
 | **Default 500 iterations** | `PYTHONPATH="torture tool" python -m torture --engine-bin ./kvdb.exe` | Omitting `--iterations` defaults to **500 iterations** as mandated by hackathon rules. |
 
+### 3. Hands-On Interactive CLI Walkthrough for Judges
+
+Judges can test all database operations and performance guarantees directly from the command line in **Git Bash** (or Windows PowerShell):
+
+#### A. Initialize / Open Database
+```bash
+./kvdb.exe open ./my_test.db
+```
+*(If `./my_test.db` does not exist, it creates a fresh crash-safe 16-byte authoritative file and reports `keys=0 recovery=<duration>` before cleanly closing).*
+
+#### B. Insert or Update Key-Value Pairs (`put`)
+```bash
+# Syntax: ./kvdb.exe put <db_file> <key> <value>
+./kvdb.exe put ./my_test.db name "Hrithik"
+./kvdb.exe put ./my_test.db role "Lead Engineer"
+./kvdb.exe put ./my_test.db score 100
+```
+*(Every write encodes a binary record with IEEE CRC32 checksum, flushes to disk with `fsync`, and returns `OK`).*
+
+#### C. Read Key Values (`get`)
+```bash
+# Syntax: ./kvdb.exe get <db_file> <key>
+./kvdb.exe get ./my_test.db name
+# Output: Hrithik
+
+./kvdb.exe get ./my_test.db role
+# Output: Lead Engineer
+
+./kvdb.exe get ./my_test.db non_existent
+# Output: NOTFOUND
+```
+*(Performs direct O(1) in-memory index lookup and reads the exact bytes from disk at `valueOffset` using `ReadAt`).*
+
+#### D. Dump All Live Key-Values (`dump`)
+```bash
+./kvdb.exe dump ./my_test.db
+```
+**Output:**
+```
+name Hrithik
+role Lead Engineer
+score 100
+```
+*(Dumps all live, un-deleted keys and their values sorted alphabetically).*
+
+#### E. Delete a Key (`del`)
+```bash
+# Syntax: ./kvdb.exe del <db_file> <key>
+./kvdb.exe del ./my_test.db score
+# Output: OK
+
+# Verify it is deleted:
+./kvdb.exe get ./my_test.db score
+# Output: NOTFOUND
+```
+*(Appends an authoritative durable tombstone record, syncs it, and removes the key from the live index).*
+
+#### F. Atomic Multi-Operation Batch (`batch`)
+```bash
+cat <<EOF | ./kvdb.exe batch ./my_test.db
+put city "Bangalore"
+put hackathon "Kill It and Prove It"
+del role
+EOF
+```
+**Output:** `OK`
+
+Verify the batch was applied atomically:
+```bash
+./kvdb.exe dump ./my_test.db
+```
+**Output:**
+```
+city Bangalore
+hackathon Kill It and Prove It
+name Hrithik
+```
+
+#### G. High-Volume Batch (10,000 Operations in Exactly One Record)
+```bash
+# Submit an atomic batch of 10,000 operations in one command:
+python -c 'for i in range(10000): print(f"put key_{i:05d} value_{i:05d}")' | ./kvdb.exe batch ./test_batch.db
+
+# Verify all 10,000 keys recovered in milliseconds:
+./kvdb.exe open ./test_batch.db
+# Output: keys=10000 recovery=2.8ms
+
+# Verify 10,001 operations are strictly rejected upfront:
+python -c 'for i in range(10001): print(f"put key_{i:05d} value_{i:05d}")' | ./kvdb.exe batch ./test_batch.db
+# Output: batch error: batch exceeds maximum of 10,000 operations
+```
+
+#### H. Recover 1 Million Keys in Under 2 Seconds
+```bash
+go test -v -run TestRecovery_MillionKeys -timeout 120s ./engine/...
+```
+**Output:**
+```
+=== RUN   TestRecovery_MillionKeys
+    perf_test.go:104: Phase 1: building database with 1,000,000 keys …
+    perf_test.go:110: Build complete in 1.04s — file size: 53.4 MB
+    perf_test.go:117: Phase 2: measuring Open() recovery …
+    perf_test.go:133: Recovery elapsed:   627.07ms
+    perf_test.go:134: Recovered keys:     1000000
+    perf_test.go:191: PERFORMANCE PASS: recovery in 627.07ms (target: <2s)
+--- PASS: TestRecovery_MillionKeys (1.70s)
+PASS
+```
+
+#### I. Compaction (Reclaim Space and Shrink Database)
+```bash
+# 1. Insert large keys (~100 KB):
+python -c 'import subprocess; [subprocess.run(["./kvdb.exe", "put", "./demo.db", f"k_{i:02d}", "X"*2048]) for i in range(50)]'
+ls -lh ./demo.db # Size: ~104 KB
+
+# 2. Delete 40 keys:
+python -c 'import subprocess; [subprocess.run(["./kvdb.exe", "del", "./demo.db", f"k_{i:02d}"]) for i in range(40)]'
+ls -lh ./demo.db # Size: ~105 KB (append-only log holds tombstones)
+
+# 3. Compact file:
+./kvdb.exe compact ./demo.db
+ls -lh ./demo.db # Size: ~20 KB (SHRUNK by 80%!)
+
+# Clean up demo files:
+rm -f ./my_test.db* ./test_batch.db* ./demo.db*
+```
+
 ---
 
 ## How to Run Tests
